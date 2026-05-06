@@ -1,0 +1,59 @@
+#!/bin/bash
+#SBATCH --job-name=toucan_gipo_llama8b_2gpu
+#SBATCH --partition=gpu
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=128G
+#SBATCH --time=48:00:00
+#SBATCH --output=logs/toucan_gipo_llama8b_2gpu_%j.out
+#SBATCH --error=logs/toucan_gipo_llama8b_2gpu_%j.err
+#SBATCH --partition=fengl2
+
+# ===========================================================================
+# Toucan Dataset — GIPO 2-GPU — LLaMA 3.1-8B
+# ===========================================================================
+# Checkpoint: outputs/toucan/checkpoints/gipo_2gpu_llama31_8b/
+# Eval:       outputs/toucan/eval_gipo_2gpu_llama31_8b_results/
+# ===========================================================================
+
+MODEL="llama3.1-8b"
+STEPS=${1:-"3,4,5"}
+STAGE=${2:-"grpo"}
+
+ADAMACRO_DIR="/path/to/CIPO"
+DATA_DIR="/path/to/CIPO/Toucan"
+OUTPUT_DIR="/path/to/CIPO/outputs/toucan"
+
+cd ${ADAMACRO_DIR}
+mkdir -p logs
+
+echo "============================================================"
+echo "Toucan — GIPO 2-GPU — LLaMA 3.1-8B"
+echo "============================================================"
+echo "Job ID: ${SLURM_JOB_ID} | Node: ${SLURM_NODELIST} | GPUs: ${CUDA_VISIBLE_DEVICES}"
+echo "Model: ${MODEL} | Steps: ${STEPS} | Stage: ${STAGE}"
+echo "Data: ${DATA_DIR} | Output: ${OUTPUT_DIR}"
+echo "Time: $(date)"
+echo "============================================================"
+
+source $CONDA_PREFIX/etc/profile.d/conda.sh
+conda activate tool
+
+python scripts/run_pipeline_gipo_dataset.py \
+    --dataset toucan \
+    --rl-dataset ${DATA_DIR}/rl_dataset_toucan.json \
+    --all-tools ${DATA_DIR}/all_tools_toucan.json \
+    --tool-simulator-db ${DATA_DIR}/tool_simulator_database_toucan.json \
+    --output-dir ${OUTPUT_DIR} \
+    --model ${MODEL} \
+    --steps ${STEPS} \
+    --stage ${STAGE} \
+    --gpu-mode 2gpu \
+    --max-merges 50 --min-freq 3 --max-macro-len 6 \
+    --max-episodes 100 --max-turns 30 --max-atomic-calls 50
+
+echo "============================================================"
+echo "Toucan — LLaMA 3.1-8B 2-GPU completed at $(date)"
+echo "============================================================"

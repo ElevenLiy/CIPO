@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Checkpoints & outputs
+outputs/
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Data
+*.jsonl
+*.json
+!requirements.txt
+
+# Logs
+logs/
+*.log
+*.err
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Env
+.env
+*.env
