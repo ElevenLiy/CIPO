@@ -1,19 +1,3 @@
-"""
-AdaMacro: Main Pipeline Runner
-================================
-
-Orchestrates the full AdaMacro pipeline:
-  Step 1: BPE Macro Mining
-  Step 2: Skill Instantiation
-  Step 3: SFT Training
-  Step 4: GRPO Training
-  Step 5: Evaluation
-
-Usage:
-  python run_pipeline.py --model qwen2.5-7b --steps 1,2,3,4,5
-  python run_pipeline.py --model llama3.2-3b --steps 1,2  # Only mining + instantiation
-  python run_pipeline.py --model qwen2.5-7b --steps 5 --stage sft  # Evaluate SFT only
-"""
 
 import argparse
 import logging
@@ -47,7 +31,6 @@ logger = logging.getLogger(__name__)
 
 
 def run_step1(args):
-    """BPE Macro Mining."""
     from step1_bpe_mining import load_successful_sequences, BPEMacroMiner, load_tool_schemas
     import json
 
@@ -65,7 +48,6 @@ def run_step1(args):
     miner = BPEMacroMiner(bpe_config)
     macros = miner.mine(sequences)
 
-    # Enrich with tool schemas
     tool_schemas = load_tool_schemas(ALL_TOOLS_PATH)
     for mid, macro in macros.items():
         enriched = []
@@ -96,7 +78,6 @@ def run_step1(args):
 
 
 def run_step2(args):
-    """Skill Instantiation."""
     from step2_skill_instantiation import build_augmented_tools
     import json
 
@@ -116,7 +97,6 @@ def run_step2(args):
 
 
 def run_step3(args):
-    """SFT Training."""
     from step3_sft_training import generate_sft_data, train_sft
 
     sft_config = SFTConfig()
@@ -137,7 +117,6 @@ def run_step3(args):
 
 
 def run_step4(args):
-    """GRPO Training (Online mode)."""
     from step4_grpo_training import generate_grpo_rollouts, train_grpo
 
     grpo_config = GRPOConfig()
@@ -149,7 +128,6 @@ def run_step4(args):
     grpo_dir = os.path.join(CHECKPOINT_DIR, "grpo", args.model)
     os.makedirs(grpo_dir, exist_ok=True)
 
-    # Online GRPO: rollouts generated on-the-fly, no offline generation needed
     generate_grpo_rollouts()
 
     logger.info(f"[Step 4] Online GRPO training with {args.model}...")
@@ -158,7 +136,6 @@ def run_step4(args):
 
 
 def run_step5(args):
-    """Evaluation."""
     from step5_evaluation import evaluate
 
     eval_config = EvalConfig(
@@ -166,7 +143,6 @@ def run_step5(args):
         max_atomic_calls=args.max_atomic_calls,
     )
 
-    # Determine checkpoint
     if args.stage == "base":
         lora_path = None
     elif args.stage == "sft":
@@ -201,19 +177,16 @@ def main():
                        choices=["base", "sft", "grpo"],
                        help="Evaluation stage")
 
-    # BPE params
     parser.add_argument("--max-merges", type=int, default=50)
     parser.add_argument("--min-freq", type=int, default=3)
     parser.add_argument("--max-macro-len", type=int, default=6)
 
-    # Training params
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lora-rank", type=int, default=None)
     parser.add_argument("--group-size", type=int, default=None)
 
-    # Eval params
     parser.add_argument("--max-turns", type=int, default=30)
     parser.add_argument("--max-atomic-calls", type=int, default=50)
     parser.add_argument("--max-episodes", type=int, default=100)

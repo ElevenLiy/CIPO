@@ -10,16 +10,6 @@
 #SBATCH --output=logs/fig1d_grpo_%j.out
 #SBATCH --error=logs/fig1d_grpo_%j.err
 
-# ===========================================================================
-# Figure 1 Panel (d): Counterfactual rollout — Standard GRPO policy
-# ===========================================================================
-# Replays the same prompts used by the SFT run to ensure a fair comparison.
-# Requires: SFT results already exist at ../figure1/outputs/exp_c_full_sft.json
-#
-# Usage:
-#   sbatch run_figure1d_grpo.sh                    # Default: qwen2.5-7b
-#   sbatch run_figure1d_grpo.sh qwen2.5-7b         # Explicit
-# ===========================================================================
 
 MODEL=${1:-"qwen2.5-7b"}
 

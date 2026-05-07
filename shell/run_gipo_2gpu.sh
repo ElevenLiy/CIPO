@@ -11,30 +11,11 @@
 #SBATCH --error=logs/gipo_2gpu_%j.err
 #SBATCH --partition=fengl2
 
-# ===========================================================================
-# GIPO 2-GPU Experiment Runner (for 7B/8B models)
-# ===========================================================================
-# Uses model parallelism (device_map="auto"), NOT DDP/torchrun.
-# GIPO rollouts are serial, so we split the model across 2 GPUs for memory.
-#
-# Usage:
-#   sbatch run_gipo_2gpu.sh                              # Default: qwen2.5-7b, steps 3,4,5
-#   sbatch run_gipo_2gpu.sh qwen2.5-7b 3,4,5             # SFT + GIPO + eval
-#   sbatch run_gipo_2gpu.sh llama3.1-8b 4,5               # GIPO training + eval only
-#   sbatch run_gipo_2gpu.sh qwen2.5-7b 5 sft              # Evaluate SFT only
-#
-# Checkpoint directories:
-#   GIPO checkpoints: checkpoints/gipo_qwen7b/ or checkpoints/gipo_llama8b/
-#   GIPO eval results: eval_gipo_results/
-#   (SFT checkpoints are shared with other pipelines)
-# ===========================================================================
 
-# --- Parameters ---
 MODEL=${1:-"qwen2.5-7b"}
 STEPS=${2:-"3,4,5"}
 STAGE=${3:-"grpo"}
 
-# --- Project paths ---
 ADAMACRO_DIR="/path/to/CIPO"
 cd ${ADAMACRO_DIR}
 
@@ -52,13 +33,9 @@ echo "Stage:      ${STAGE}"
 echo "Time:       $(date)"
 echo "============================================================"
 
-# --- Environment setup ---
 source $CONDA_PREFIX/etc/profile.d/conda.sh
 conda activate tool
 
-# --- Run GIPO 2-GPU pipeline ---
-# NOTE: Using plain python, NOT torchrun. Model parallelism is handled
-# inside the script via device_map="auto" and accelerate.
 python scripts/run_pipeline_gipo_2gpu.py \
     --model ${MODEL} \
     --steps ${STEPS} \

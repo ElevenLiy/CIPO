@@ -11,33 +11,11 @@
 #SBATCH --error=logs/gipo_llama3b_%j.err
 #SBATCH --partition=fengl2
 
-# ===========================================================================
-# GIPO Single-GPU Experiment for LLaMA 3.2-3B
-# ===========================================================================
-# Uses GIPO3BConfig (lr=3e-6, lora_rank=48, no gradient checkpointing).
-# LLaMA 3.2-3B fits comfortably on a single GPU.
-#
-# Checkpoint directory:  checkpoints/gipo_llama32_3b/
-# Eval directory:        eval_gipo_llama32_3b_results/
-#
-# Usage:
-#   sbatch run_gipo_llama.sh                              # Default: SFT + GIPO + eval
-#   sbatch run_gipo_llama.sh llama3.2-3b 4,5              # GIPO training + eval only (if SFT already done)
-#   sbatch run_gipo_llama.sh llama3.2-3b 1,2,3,4,5        # Full pipeline from scratch
-#   sbatch run_gipo_llama.sh llama3.2-3b 5 sft            # Evaluate SFT only
-#
-# NOTE: Steps 1-2 (BPE mining + Skill instantiation) are model-agnostic and
-#       shared across all pipelines. Only run them if not done before.
-#       Step 3 (SFT) checkpoint is shared at checkpoints/sft/llama3.2-3b/.
-#       Only re-run Step 3 if SFT hasn't been trained for this model yet.
-# ===========================================================================
 
-# --- Parameters ---
 MODEL=${1:-"llama3.2-3b"}
 STEPS=${2:-"3,4,5"}
 STAGE=${3:-"grpo"}
 
-# --- Project paths ---
 ADAMACRO_DIR="/path/to/CIPO"
 cd ${ADAMACRO_DIR}
 
@@ -55,11 +33,9 @@ echo "Stage:      ${STAGE}"
 echo "Time:       $(date)"
 echo "============================================================"
 
-# --- Environment setup ---
 source $CONDA_PREFIX/etc/profile.d/conda.sh
 conda activate tool
 
-# --- Run GIPO pipeline ---
 python scripts/run_pipeline_gipo_llama.py \
     --model ${MODEL} \
     --steps ${STEPS} \

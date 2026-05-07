@@ -10,16 +10,6 @@
 #SBATCH --output=logs/std_grpo_%j.out
 #SBATCH --error=logs/std_grpo_%j.err
 
-# ===========================================================================
-# Standard GRPO Training (R = R_task only, no skill bias)
-# ===========================================================================
-# For Figure 1(d) baseline comparison.
-#
-# Usage:
-#   sbatch run_standard_grpo.sh                        # Default: qwen2.5-7b, 1 epoch, G=2
-#   sbatch run_standard_grpo.sh qwen2.5-7b 1 2        # Explicit
-#   sbatch run_standard_grpo.sh qwen2.5-7b 2 4        # 2 epochs, G=4
-# ===========================================================================
 
 MODEL=${1:-"qwen2.5-7b"}
 EPOCHS=${2:-1}

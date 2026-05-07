@@ -1,16 +1,3 @@
-"""
-AdaMacro Step 3: SFT Data Generation & Training
-=================================================
-
-Implements the SFT stage from Section 2.3:
-- Generate SFT training data from successful trajectories
-- Convert trajectories to use skills where applicable
-- Train with LoRA on the augmented tool library (atoms + skills)
-- Model learns basic tool call format AND that skills are available
-
-Input:  rl_dataset, augmented_tools.json, skill_library.json
-Output: SFT training data, LoRA checkpoint
-"""
 
 import json
 import copy
@@ -33,27 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# SFT Data Generation
-# ============================================================================
-
 def build_skill_matcher(skill_library_path: str) -> Dict[str, Dict]:
-    """
-    Build a matcher that identifies subsequences in trajectories that
-    can be replaced by skill invocations.
-
-    Tool chains are normalized (version suffixes stripped) so they match
-    the normalized tool_names in trajectories.
-
-    Returns:
-        {
-            skill_name: {
-                "tool_chain": [normalized_name1, normalized_name2, ...],
-                "length": int,
-                "skill_def": dict,
-            }
-        }
-    """
     import re as _re
 
     def _normalize(name: str) -> str:
@@ -68,7 +35,6 @@ def build_skill_matcher(skill_library_path: str) -> Dict[str, Dict]:
     for macro_id, macro in macros.items():
         skill_name = f"skill_{macro_id}"
         raw_chain = macro.get("tool_names", [])
-        # Normalize chain names to match trajectory tool names
         tool_chain = [_normalize(t) for t in raw_chain]
         if len(tool_chain) >= 2:
             matchers[skill_name] = {
@@ -86,22 +52,9 @@ def match_skills_in_sequence(
     output_texts: List[str],
     skill_matchers: Dict[str, Dict],
 ) -> List[Dict]:
-    """
-    Identify skill-substitutable subsequences in a tool sequence.
-    
-    Uses greedy longest-match: for each position, try matching the longest
-    skill first.
-    
-    Returns:
-        List of actions, each either:
-        - {"type": "atomic", "tool_name": str, "args": str, "output": str}
-        - {"type": "skill", "skill_name": str, "args": dict, "sub_steps": [...],
-           "output": str}
-    """
     n = len(tool_names)
     actions = []
     
-    # Sort matchers by chain length (longest first for greedy matching)
     sorted_matchers = sorted(
         skill_matchers.items(),
         key=lambda x: x[1]["length"],
@@ -119,9 +72,7 @@ def match_skills_in_sequence(
             if i + chain_len > n:
                 continue
             
-            # Check if tool_names[i:i+chain_len] matches the skill chain
             if tool_names[i:i + chain_len] == chain:
-                # Build skill invocation
                 sub_steps = []
                 sub_args = {}
                 sub_output = ""
@@ -142,11 +93,9 @@ def match_skills_in_sequence(
                         "output": step_output,
                     })
                     
-                    # First step args become exposed params
                     if j == 0:
                         sub_args = step_args
                     
-                    # Last step output is the skill output
                     if j == chain_len - 1:
                         sub_output = step_output
                 
@@ -163,7 +112,6 @@ def match_skills_in_sequence(
                 break
         
         if not matched:
-            # Atomic action
             args_str = tool_args[i] if i < len(tool_args) else "{}"
             output = output_texts[i] if i < len(output_texts) else ""
             
@@ -179,7 +127,6 @@ def match_skills_in_sequence(
 
 
 def format_tool_call_message(tool_name: str, args: Any) -> str:
-    """Format a tool call as the assistant would generate it."""
     if isinstance(args, str):
         try:
             args = json.loads(args)
@@ -198,19 +145,6 @@ def generate_sft_data(
     skill_library_path: str,
     output_path: str,
 ) -> List[Dict]:
-    """
-    Generate SFT training data with diversity.
-    
-    For each successful trajectory, generate MULTIPLE training examples:
-    1. Original atomic trajectory (teaches correct tool sequence)
-    2. Skill-substituted trajectory (teaches skill usage)
-    3. Partial-skill trajectory (teaches mixing skills + atomic)
-    
-    Key improvements:
-    - System prompt matches GRPO/eval format exactly
-    - Tool list is per-task (includes gt_tools + skills + sample of others)
-    - Multiple trajectory variants per task for diversity
-    """
     import random
 
     with open(rl_dataset_path, "r", encoding="utf-8") as f:
@@ -219,12 +153,10 @@ def generate_sft_data(
     with open(augmented_tools_path, "r", encoding="utf-8") as f:
         augmented_tools = json.load(f)
 
-    # Build tool description map (matching GRPO format exactly)
     tool_desc_map = {}
     skill_names = set()
 
     def _normalize_tool_name(name: str) -> str:
-        """Strip version suffixes like _v1, _v13."""
         import re as _re
         return _re.sub(r'_v\d+\w*$', '', name)
 
@@ -240,7 +172,6 @@ def generate_sft_data(
                 param_names = list(props.keys())[:5]
                 param_str = f" params: {param_names}"
 
-        # For skills: show the tool chain so model knows what's inside
         chain_str = ""
         if t.get("is_skill"):
             chain = t.get("tool_chain", [])
@@ -254,15 +185,12 @@ def generate_sft_data(
         if t.get("is_skill"):
             skill_names.add(norm_name)
 
-    # Build skill matcher
     skill_matchers = build_skill_matcher(skill_library_path)
 
     def build_per_task_tool_list(gt_tools: List[str]) -> str:
-        """Build tool list for system prompt. Includes gt_tools + skills + sample."""
         lines = []
         seen = set()
 
-        # 1. Skills first (always visible)
         for tn in skill_names:
             if tn in tool_desc_map:
                 lines.append(tool_desc_map[tn])
@@ -270,13 +198,11 @@ def generate_sft_data(
             if len(seen) >= 15:
                 break
 
-        # 2. GT tools (so model sees correct tools during training)
         for tn in gt_tools:
             if tn not in seen and tn in tool_desc_map:
                 lines.append(tool_desc_map[tn])
                 seen.add(tn)
 
-        # 3. Tools related to gt (same prefix/category)
         gt_prefixes = set()
         for tn in gt_tools:
             parts = tn.replace("-", "_").split("_")
@@ -292,7 +218,6 @@ def generate_sft_data(
             if len(seen) >= 35:
                 break
 
-        # 4. Random fill to 50
         remaining = [tn for tn in tool_desc_map if tn not in seen]
         random.shuffle(remaining)
         for tn in remaining:
@@ -304,7 +229,6 @@ def generate_sft_data(
         return "\n".join(lines), len([tn for tn in seen if tn in skill_names])
 
     def build_system_prompt(tool_list_str: str, n_tools: int, n_skills: int) -> str:
-        """Build system prompt matching GRPO/eval format exactly."""
         return (
             "You are a tool-calling agent. You MUST use tools to complete tasks. "
             "Do NOT answer directly — always call at least one tool first.\n\n"
@@ -321,11 +245,6 @@ def generate_sft_data(
         )
 
     def build_messages(system_prompt, user_prompt, actions) -> List[Dict]:
-        """Build conversation messages from action sequence.
-
-        Uses XML <tool_call>/<tool_response> format matching GRPO/eval exactly.
-        This ensures SFT teaches the same format the model needs at RL time.
-        """
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -345,13 +264,11 @@ def generate_sft_data(
                     args = {}
                 output = action["output"][:1500] if isinstance(action["output"], str) else ""
 
-            # Assistant: XML tool call (matches GRPO format)
             tc_json = json.dumps({"name": tool_name, "arguments": args}, ensure_ascii=False)
             messages.append({
                 "role": "assistant",
                 "content": f"<tool_call>\n{tc_json}\n</tool_call>",
             })
-            # User: XML tool response (matches GRPO format)
             messages.append({
                 "role": "user",
                 "content": f"<tool_response name=\"{tool_name}\">\n{output}\n</tool_response>",
@@ -379,14 +296,9 @@ def generate_sft_data(
         if not tool_names or not user_prompt:
             continue
 
-        # Build per-task tool list and system prompt
         tool_list_str, n_skills = build_per_task_tool_list(gt_tools)
         system_prompt = build_system_prompt(tool_list_str, 50, n_skills)
 
-        # ============================================================
-        # Variant 1: Original atomic trajectory
-        # Teaches: correct tool sequence for this task
-        # ============================================================
         atomic_actions = []
         for i, tn in enumerate(tool_names):
             atomic_actions.append({
@@ -408,10 +320,6 @@ def generate_sft_data(
         })
         atomic_only_count += 1
 
-        # ============================================================
-        # Variant 2: Full skill substitution
-        # Teaches: use skills where possible
-        # ============================================================
         skill_actions = match_skills_in_sequence(
             tool_names, tool_args, output_texts, skill_matchers
         )
@@ -430,10 +338,6 @@ def generate_sft_data(
             })
             skill_used_count += 1
 
-        # ============================================================
-        # Variant 3: Partial skill (only first skill match, rest atomic)
-        # Teaches: mixing skills and atomic tools
-        # ============================================================
         if has_skill and len(skill_actions) >= 2:
             partial_actions = []
             first_skill_done = False
@@ -442,7 +346,6 @@ def generate_sft_data(
                     partial_actions.append(action)
                     first_skill_done = True
                 elif action["type"] == "skill" and first_skill_done:
-                    # Expand this skill back to atomic
                     for sub in action.get("sub_steps", []):
                         partial_actions.append({
                             "type": "atomic",
@@ -465,23 +368,9 @@ def generate_sft_data(
             })
             mixed_count += 1
 
-        # ============================================================
-        # Variant 4: Continuation from intermediate state
-        #
-        # For trajectory [A, B, C, D], generate:
-        #   prefix=[A]     → continuation=[B, C, D, done]
-        #   prefix=[A,B]   → continuation=[C, D, done]
-        #   prefix=[A,B,C] → continuation=[D, done]
-        #
-        # Skip step0 (= full trajectory, same as Variant 1).
-        # Each sample teaches: "given what's done, here's the
-        # COMPLETE remaining sequence to finish the task."
-        # ============================================================
         if len(atomic_actions) >= 3:
-            # Start from step 1 (skip 0=full traj), cap at 3 samples
             start_indices = list(range(1, len(atomic_actions)))
             if len(start_indices) > 3:
-                # Take evenly spaced: early, middle, late
                 n = len(start_indices)
                 start_indices = [start_indices[0], start_indices[n//2], start_indices[-1]]
 
@@ -489,13 +378,11 @@ def generate_sft_data(
                 prefix = atomic_actions[:step_idx]
                 remaining = atomic_actions[step_idx:]
 
-                # Build: system + user + prefix (as context) + remaining (as target)
                 step_messages = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ]
 
-                # Add prefix (tools already called — this is context)
                 for prev in prefix:
                     prev_name = prev.get("skill_name") if prev["type"] == "skill" else prev["tool_name"]
                     try:
@@ -516,7 +403,6 @@ def generate_sft_data(
                         "content": f"<tool_response name=\"{prev_name}\">\n{prev_output}\n</tool_response>",
                     })
 
-                # Add remaining sequence (target for learning)
                 for rem in remaining:
                     rem_name = rem.get("skill_name") if rem["type"] == "skill" else rem["tool_name"]
                     try:
@@ -537,7 +423,6 @@ def generate_sft_data(
                         "content": f"<tool_response name=\"{rem_name}\">\n{rem_output}\n</tool_response>",
                     })
 
-                # End with done
                 step_messages.append({"role": "assistant", "content": "Task completed successfully."})
 
                 sft_examples.append({
@@ -551,7 +436,6 @@ def generate_sft_data(
                 })
                 stepwise_count += 1
 
-    # Save
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump({
             "meta": {
@@ -574,23 +458,10 @@ def generate_sft_data(
     return sft_examples
 
 
-# ============================================================================
-# SFT Training with LoRA
-# ============================================================================
-
 def _tokenize_with_assistant_mask(messages, tokenizer, max_length=4096):
-    """Tokenize messages and mask loss to assistant tokens only.
-
-    This is the same masking logic used in GRPO (step4), ensuring SFT and
-    RL stages train on the exact same token positions.
-
-    Returns dict with input_ids, attention_mask, labels (all tensors).
-    Non-assistant tokens have labels=-100 (ignored by CrossEntropyLoss).
-    """
     import re as _re
     import torch
 
-    # Messages are already in pure system/user/assistant format
     formatted = [{"role": m["role"], "content": m.get("content", "") or ""} for m in messages]
     try:
         text = tokenizer.apply_chat_template(formatted, tokenize=False, add_generation_prompt=False)
@@ -603,12 +474,9 @@ def _tokenize_with_assistant_mask(messages, tokenizer, max_length=4096):
     attention_mask = enc["attention_mask"].squeeze(0)
     labels = torch.full_like(input_ids, -100)
 
-    # Find assistant regions in the decoded text
     decoded = tokenizer.decode(input_ids, skip_special_tokens=False)
     patterns = [
-        # Qwen2 / ChatML format
         r'<\|im_start\|>assistant\n(.*?)(?:<\|im_end\|>)',
-        # Llama-3 format
         r'<\|start_header_id\|>assistant<\|end_header_id\|>\n\n(.*?)(?:<\|eot_id\|>)',
     ]
     regions = []
@@ -617,11 +485,9 @@ def _tokenize_with_assistant_mask(messages, tokenizer, max_length=4096):
             regions.append((m.start(1), m.end(1)))
 
     if not regions:
-        # Fallback: train on everything (better than training on nothing)
         labels = input_ids.clone()
         return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
-    # Map character regions to token indices via offset_mapping
     enc2 = tokenizer(decoded, return_offsets_mapping=True, add_special_tokens=False,
                      truncation=True, max_length=max_length)
     offsets = enc2.get("offset_mapping", [])
@@ -634,7 +500,6 @@ def _tokenize_with_assistant_mask(messages, tokenizer, max_length=4096):
                     if te > cs and ts < ce:
                         labels[ti] = input_ids[ti]
     else:
-        # Fallback: heuristic role-based detection
         toks = [tokenizer.decode([t]) for t in input_ids.tolist()]
         in_asst = False
         for idx, tok_text in enumerate(toks):
@@ -656,13 +521,6 @@ def train_sft(
     output_dir: str,
     sft_config: SFTConfig,
 ):
-    """
-    Fine-tune model with LoRA using SFT data.
-
-    Uses standard HuggingFace Trainer with assistant-only loss masking.
-    Only assistant tokens (tool calls + final summary) contribute to loss,
-    matching the GRPO stage's tokenize_with_assistant_mask exactly.
-    """
     import torch
     from torch.utils.data import Dataset as TorchDataset
     from transformers import (
@@ -676,7 +534,6 @@ def train_sft(
     model_path = get_model_path(model_name)
     logger.info(f"Loading model: {model_name} from {model_path}")
 
-    # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
         trust_remote_code=True,
@@ -685,16 +542,14 @@ def train_sft(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load model
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,
-        device_map={"": 0},   # SFT with LoRA fits on single GPU (even 7B/8B)
+        device_map={"": 0},
         trust_remote_code=True,
     )
     model.config.use_cache = False
 
-    # LoRA configuration
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=sft_config.lora_rank,
@@ -707,16 +562,12 @@ def train_sft(
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    # Load SFT data
     with open(sft_data_path, "r", encoding="utf-8") as f:
         sft_data = json.load(f)
 
     examples = sft_data.get("examples", [])
     logger.info(f"Loaded {len(examples)} SFT examples")
 
-    # ----------------------------------------------------------------
-    # Pre-tokenize all examples with assistant-only mask
-    # ----------------------------------------------------------------
     max_seq_len = sft_config.max_seq_length
     tokenized_examples = []
     n_skipped = 0
@@ -740,7 +591,6 @@ def train_sft(
                     f"({avg_asst/max(avg_total,1)*100:.1f}% supervised)")
 
     class PreTokenizedDataset(TorchDataset):
-        """Dataset that returns pre-tokenized examples with labels mask."""
         def __init__(self, items):
             self.items = items
         def __len__(self):
@@ -750,7 +600,6 @@ def train_sft(
 
     dataset = PreTokenizedDataset(tokenized_examples)
 
-    # Data collator: pad to max length within batch
     def collate_fn(batch):
         max_len = max(len(b["input_ids"]) for b in batch)
         input_ids = []
@@ -769,7 +618,6 @@ def train_sft(
 
     logger.info(f"Dataset size: {len(dataset)}")
 
-    # Training arguments
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=sft_config.num_epochs,
@@ -786,12 +634,10 @@ def train_sft(
         report_to="none",
         max_grad_norm=1.0,
         lr_scheduler_type="cosine",
-        dataloader_num_workers=0,  # pre-tokenized, no need for workers
+        dataloader_num_workers=0,
         remove_unused_columns=False,
     )
 
-    # Enable gradient checkpointing with input requires_grad
-    # (required for PEFT + gradient_checkpointing + standard Trainer)
     if training_args.gradient_checkpointing:
         model.enable_input_require_grads()
 
@@ -802,20 +648,14 @@ def train_sft(
         data_collator=collate_fn,
     )
 
-    # Train
     logger.info("Starting SFT training (assistant-only loss mask)...")
     trainer.train()
 
-    # Save
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
 
     logger.info(f"SFT training complete. Model saved to {output_dir}")
 
-
-# ============================================================================
-# Main
-# ============================================================================
 
 def main():
     import argparse
@@ -830,7 +670,6 @@ def main():
                        help="Only generate SFT data, skip training")
     parser.add_argument("--train-only", action="store_true",
                        help="Only train, skip data generation")
-    # Override SFT config
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -849,7 +688,6 @@ def main():
     logger.info("AdaMacro Step 3: SFT Data Generation & Training")
     logger.info("=" * 70)
     
-    # Step 1: Generate SFT data
     if not args.train_only:
         logger.info("\n[Phase 1] Generating SFT training data...")
         generate_sft_data(
@@ -859,7 +697,6 @@ def main():
             args.sft_data,
         )
     
-    # Step 2: Train
     if not args.generate_only:
         logger.info(f"\n[Phase 2] Training with model: {args.model}")
         train_sft(

@@ -1,17 +1,3 @@
-"""
-AdaMacro Step 5: Evaluation
-============================
-
-Evaluates the trained model on test trajectories.
-
-Metrics (Section 3.3):
-- Task success rate
-- Decision steps (number of policy decisions)
-- Atomic tool calls (true budget measure)
-- Skill usage ratio, coverage, success rate
-- Skill interrupt ratio & position distribution
-- select_strategy hit rate
-"""
 
 import json
 import logging
@@ -35,15 +21,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# Agent with Skill Support
-# ============================================================================
-
 class AdaMacroAgent:
-    """
-    Agent that can use both atomic tools and skills.
-    Handles skill execution with trace and soft-interrupt.
-    """
 
     def __init__(
         self,
@@ -56,12 +34,10 @@ class AdaMacroAgent:
         self.eval_config = eval_config
         self.augmented_tools = augmented_tools
 
-        # Separate skills from atomic tools
         self.skills = {t["name"]: t for t in augmented_tools if t.get("is_skill")}
         self.atomic_tools = {t["name"]: t for t in augmented_tools if not t.get("is_skill")}
 
-        # Build normalized → original name mapping (matches step4 ToolEnvironment.execute)
-        self._norm_to_orig = {}  # normalized_name → original_name
+        self._norm_to_orig = {}
         self._known_tool_names = set()
         for t in augmented_tools:
             name = t["name"]
@@ -71,14 +47,11 @@ class AdaMacroAgent:
             if norm not in self._norm_to_orig:
                 self._norm_to_orig[norm] = name
 
-        # Skill interpreter
         self.interpreter = SkillInterpreter(tool_simulator_db)
 
-        # Load model
         self._load_model(model_path, lora_path)
 
     def _load_model(self, model_path: str, lora_path: Optional[str] = None):
-        """Load the model with optional LoRA adapter."""
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -99,11 +72,6 @@ class AdaMacroAgent:
         self.model.eval()
 
     def generate_action(self, messages: List[Dict], has_prior_actions: bool = False) -> Dict:
-        """Generate the next action.
-        
-        Turn 0 (no prior actions): forced prefix, single generation
-        Turn 1+ (has prior actions): free generation, natural stop if text
-        """
         import torch
 
         TOOL_CALL_PREFIX = '<tool_call>\n{"name": "'
@@ -131,7 +99,6 @@ class AdaMacroAgent:
             gen_kwargs["top_p"] = self.eval_config.top_p
 
         if not has_prior_actions:
-            # --- FIRST TURN: forced prefix ---
             forced_prompt = prompt + TOOL_CALL_PREFIX
             try:
                 inputs = self.tokenizer(forced_prompt, return_tensors="pt", truncation=True, max_length=4096)
@@ -152,7 +119,6 @@ class AdaMacroAgent:
             if result["type"] == "tool_call":
                 return result
 
-            # Salvage: only accept if it matches a known tool name
             name_match = re.match(r'^([a-zA-Z][\w\-\.]*)', completion)
             if name_match and len(name_match.group(1)) <= 60:
                 salvaged_name = name_match.group(1)
@@ -167,7 +133,6 @@ class AdaMacroAgent:
             return {"type": "text", "content": "", "raw_response": completion}
 
         else:
-            # --- SUBSEQUENT TURNS: free generation ---
             try:
                 inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
             except (TypeError, ValueError):
@@ -183,16 +148,11 @@ class AdaMacroAgent:
             if result["type"] == "tool_call":
                 return result
 
-            # Text output → natural stop
             return {"type": "text", "content": response, "raw_response": response}
 
     def _parse_action(self, response: str) -> Dict:
-        """Parse assistant response to extract tool call.
-        Handles multiple formats: <tool_call>, raw JSON, Qwen function_call, etc.
-        """
         import re
 
-        # Format 1: <tool_call>...</tool_call>
         tc_match = re.search(r'<tool_call>\s*(.*?)\s*</tool_call>', response, re.DOTALL)
         if tc_match:
             try:
@@ -207,7 +167,6 @@ class AdaMacroAgent:
             except (json.JSONDecodeError, TypeError, AttributeError):
                 pass
 
-        # Format 2: {"name": "...", "arguments": {...}} anywhere in response
         json_match = re.search(r'\{[^{}]*"name"\s*:\s*"[^"]+?"[^{}]*\}', response)
         if json_match:
             try:
@@ -222,7 +181,6 @@ class AdaMacroAgent:
             except json.JSONDecodeError:
                 pass
 
-        # Format 3: Try full response as JSON
         try:
             tc = json.loads(response.strip())
             if isinstance(tc, dict) and "name" in tc:
@@ -235,7 +193,6 @@ class AdaMacroAgent:
         except:
             pass
 
-        # Format 4: Qwen-style function call (function_name\n{args})
         fn_match = re.search(r'(\w[\w\-\.]+)\s*\n\s*(\{.*?\})', response, re.DOTALL)
         if fn_match:
             try:
@@ -256,10 +213,8 @@ class AdaMacroAgent:
         }
 
     def _resolve_skill_name(self, tool_name: str) -> Optional[str]:
-        """Resolve a tool name to a skill key, handling normalization/aliases."""
         if tool_name in self.skills:
             return tool_name
-        # Try case-insensitive / normalized matching
         norm = tool_name.lower().replace("-", "_").replace(".", "_")
         norm = re.sub(r'_v\d+\w*$', '', norm)
         for sname in self.skills:
@@ -270,19 +225,16 @@ class AdaMacroAgent:
         return None
 
     def execute_action(self, action: Dict) -> Dict:
-        """Execute an action (either skill or atomic tool)."""
         if action["type"] != "tool_call":
             return {"output": action.get("content", ""), "trace": [], "is_skill": False}
 
         tool_name = action["name"]
         arguments = action.get("arguments", {})
-        # Defensive: ensure arguments is a dict (model may generate list/str/None)
         if not isinstance(arguments, dict):
             arguments = {}
 
         resolved_skill = self._resolve_skill_name(tool_name)
         if resolved_skill is not None:
-            # Execute skill with trace
             skill_def = self.skills[resolved_skill]
             result = self.interpreter.execute_skill(skill_def, arguments)
             return {
@@ -294,8 +246,6 @@ class AdaMacroAgent:
                 "interrupt_step": result.get("interrupt_step"),
             }
         else:
-            # Execute atomic tool via simulator
-            # Resolve name: exact → normalized → full-library scan (same as step4)
             resolved = tool_name
             output = self.interpreter._execute_tool(resolved, arguments)
             if output is None or output == "Not found":
@@ -312,9 +262,6 @@ class AdaMacroAgent:
             }
 
     def run_episode(self, user_prompt: str, available_tools_desc: str, episode_idx: int = 0, gt_tools: List[str] = None) -> Dict:
-        """Run a complete episode with the agent."""
-        # System prompt MUST match training format (step4) exactly
-        # Count tools actually in the provided description (not full library)
         n_tool_lines = sum(1 for line in available_tools_desc.split("\n") if line.strip().startswith("- "))
         n_skill_lines = sum(1 for line in available_tools_desc.split("\n") if "[SKILL]" in line)
         system_prompt = (
@@ -347,24 +294,21 @@ class AdaMacroAgent:
             "interrupt_positions": [],
         }
 
-        # Dynamic forced steps: match GRPO training logic
         gt_tools_len = len(gt_tools) if gt_tools else 0
         min_forced = min(max(3, gt_tools_len // 2), 6) if gt_tools_len > 0 else 3
-        continued = False  # at most 1 continuation nudge per episode
+        continued = False
 
         for turn in range(self.eval_config.max_turns):
             num_actions = len(episode_data["actions"])
             has_prior = num_actions >= min_forced
             action = self.generate_action(messages, has_prior_actions=has_prior)
 
-            # Log raw output for first 3 episodes to help debug
             if episode_idx < 3 and turn < 3:
                 logger.info(f"  [Debug] Episode {episode_idx} Turn {turn}: "
                            f"type={action['type']}, "
                            f"raw={action.get('raw_response', '')[:200]}")
 
             if action["type"] == "text":
-                # Check if agent stopped too early — continuation nudge
                 if (num_actions < min_forced + 1
                         and turn < self.eval_config.max_turns - 1
                         and not continued):
@@ -375,21 +319,17 @@ class AdaMacroAgent:
                         "content": "You have not completed the task yet. Continue calling tools to finish."
                     })
                     continue
-                # Agent finished
                 episode_data["final_response"] = action.get("content", "")
                 break
 
-            # Only count actual tool calls as decision steps (not text/nudge)
             episode_data["decision_steps"] += 1
 
-            # Execute
             result = self.execute_action(action)
             action["tool_output"] = str(result.get("output", ""))[:2000]
             episode_data["actions"].append(action)
 
             if result["is_skill"]:
                 episode_data["skill_calls"] += 1
-                # Use actual trace length (handles interrupted skills correctly)
                 actual_trace = result.get("trace", [])
                 episode_data["atomic_calls"] += max(len(actual_trace), 1)
 
@@ -403,12 +343,10 @@ class AdaMacroAgent:
             else:
                 episode_data["atomic_calls"] += 1
 
-            # Budget check
             if episode_data["atomic_calls"] >= self.eval_config.max_atomic_calls:
                 logger.info(f"Budget exhausted at turn {turn}")
                 break
 
-            # Add to conversation
             messages.append({
                 "role": "assistant",
                 "content": f"<tool_call>\n{{\"name\": \"{action['name']}\", \"arguments\": {json.dumps(action.get('arguments', {}), ensure_ascii=False)}}}\n</tool_call>"
@@ -421,10 +359,6 @@ class AdaMacroAgent:
         return episode_data
 
 
-# ============================================================================
-# Evaluation Runner
-# ============================================================================
-
 def evaluate(
     model_name: str,
     lora_path: Optional[str],
@@ -435,8 +369,6 @@ def evaluate(
     eval_config: EvalConfig,
     max_episodes: int = 100,
 ):
-    """Run evaluation on test episodes."""
-    # Load data
     with open(augmented_tools_path, "r") as f:
         augmented_tools = json.load(f)
 
@@ -450,9 +382,6 @@ def evaluate(
 
     episodes = rl_data.get("episodes", [])
 
-    # --- Train/test split ---
-    # Use a FIXED-SEED shuffle so that the 30% test set is domain-balanced
-    # (raw order may be grouped by domain, causing severe distribution mismatch).
     import random as _split_rand
     total_eps = len(episodes)
     indices = list(range(total_eps))
@@ -463,14 +392,12 @@ def evaluate(
     logger.info(f"Train/test split (shuffled, seed=42): {len(test_episodes)} test episodes "
                 f"out of {total_eps} total")
 
-    # Build tool description map — matches step4 format
-    # (normalized names, with [SKILL] tag and chain info)
     def _normalize_tn(name: str) -> str:
         import re as _re
         n = name.lower().replace("-", "_").replace(".", "_")
         return _re.sub(r'_v\d+\w*$', '', n)
 
-    tool_desc_map = {}  # norm_name → description string
+    tool_desc_map = {}
     norm_skill_names = set()
     for t in augmented_tools:
         orig_name = t["name"]
@@ -495,18 +422,9 @@ def evaluate(
         tool_desc_map[norm_name] = f"- {tag}{norm_name}: {t.get('description','')[:100]}{chain_str}{param_str}"
 
     def _build_tools_desc(task_name: str, gt_tools: List[str] = None) -> str:
-        """Build per-task tool list.
-
-        Standard evaluation practice (ToolBench, API-Bank): GT tools are
-        included in the available set so we test whether the model *uses*
-        the right tools, not whether the heuristic *selected* them.
-
-        Order: gt_tools → skills (≤15) → category-keyword (≤40) → random (≤50).
-        """
         lines = []
         seen = set()
 
-        # 0) Ground-truth tools first — ensures they are always available
         if gt_tools:
             for raw_gt in gt_tools:
                 norm_gt = _normalize_tn(raw_gt)
@@ -514,14 +432,12 @@ def evaluate(
                     lines.append(tool_desc_map[norm_gt])
                     seen.add(norm_gt)
 
-        # Infer tool category from task_name
         task_lower = task_name.lower().replace("-", "_")
         category_keywords = set()
         for part in task_lower.split("_"):
             if len(part) >= 3:
                 category_keywords.add(part)
 
-        # 1) Skills (always visible, core to AdaMacro)
         for tn, desc in tool_desc_map.items():
             if tn in seen:
                 continue
@@ -531,7 +447,6 @@ def evaluate(
             if len(seen) >= 15 + len(seen & set(_normalize_tn(g) for g in (gt_tools or []))):
                 break
 
-        # 2) Tools whose name matches task category keywords
         for tn, desc in tool_desc_map.items():
             if tn in seen:
                 continue
@@ -541,7 +456,6 @@ def evaluate(
             if len(seen) >= 40:
                 break
 
-        # 3) Fill remaining with random other tools
         import random as _rand
         other_tools = [tn for tn in tool_desc_map if tn not in seen]
         _rand.shuffle(other_tools)
@@ -553,7 +467,6 @@ def evaluate(
 
         return "\n".join(lines), len(seen), sum(1 for tn in seen if tn in norm_skill_names)
 
-    # Initialize agent
     model_path = get_model_path(model_name)
     agent = AdaMacroAgent(
         model_path=model_path,
@@ -573,7 +486,6 @@ def evaluate(
         logger.info(f"Episode {i+1}/{min(len(test_episodes), max_episodes)}: {task_name}")
         start_time = time.time()
 
-        # Build per-task tool list (GT tools included — standard eval practice)
         gt_tool_names = ep.get("tool_names", [])
         tools_desc, n_tools, n_skills = _build_tools_desc(task_name, gt_tools=gt_tool_names)
         episode_data = agent.run_episode(user_prompt, tools_desc, episode_idx=i, gt_tools=gt_tool_names)
@@ -586,10 +498,8 @@ def evaluate(
         episode_data["gt_tools"] = ep.get("tool_names", [])
         results.append(episode_data)
 
-    # Compute aggregate metrics
     metrics = compute_metrics(results, augmented_tools)
 
-    # Save
     output = {
         "meta": {
             "model": model_name,
@@ -624,27 +534,17 @@ def evaluate(
 
 
 def compute_metrics(results: List[Dict], augmented_tools: List[Dict]) -> Dict:
-    """Compute evaluation metrics from episode results.
-
-    KEY METRICS (reported in paper):
-      1. Tool F1       — harmonic mean of Precision and Recall (trajectory-level)
-      2. Next-tool Acc — per-step next-tool prediction accuracy
-      3. Skill Usage Ratio — fraction of decision steps that invoke a skill
-      4. Avg Decision Steps / Avg Atomic Calls — efficiency comparison
-    """
     n = len(results)
     if n == 0:
         return {}
 
     skills_available = {t["name"] for t in augmented_tools if t.get("is_skill")}
-    # Build skill → atomic chain mapping (normalized keys for consistent lookup)
     skill_chains = {}
     for t in augmented_tools:
         if t.get("is_skill"):
             chain = t.get("tool_chain", [])
             if not chain:
                 chain = [s.get("tool_name", "") for s in t.get("execution_plan", [])]
-            # Index by both original and normalized name
             skill_chains[t["name"]] = chain
             norm_key = t["name"].lower().replace("-", "_").replace(".", "_")
             import re as _re
@@ -658,11 +558,7 @@ def compute_metrics(results: List[Dict], augmented_tools: List[Dict]) -> Dict:
     total_skill_success = sum(r["skill_successes"] for r in results)
     total_skill_interrupts = sum(r["skill_interrupts"] for r in results)
 
-    # ------------------------------------------------------------------
-    # Helper functions
-    # ------------------------------------------------------------------
     def _normalize_tool_name(name: str) -> str:
-        """Strip version suffixes like _v1, _v13."""
         import re as _re
         return _re.sub(r'_v\d+\w*$', '', name)
 
@@ -673,7 +569,6 @@ def compute_metrics(results: List[Dict], augmented_tools: List[Dict]) -> Dict:
         return set(t for t in n.split("_") if len(t) >= 2)
 
     def _fuzzy_match_score(a: str, b: str) -> float:
-        """Three-level fuzzy tool matching (same as step4 reward)."""
         a_n = a.lower().replace("-", "_").replace(".", "_")
         b_n = b.lower().replace("-", "_").replace(".", "_")
         if a_n == b_n or a == b:
@@ -690,13 +585,6 @@ def compute_metrics(results: List[Dict], augmented_tools: List[Dict]) -> Dict:
                 return jaccard
         return 0.0
 
-    # ------------------------------------------------------------------
-    # KEY METRIC 1: Tool F1 (Precision, Recall, F1 per episode)
-    #
-    #   Recall    = Σ best_match(g, used) / |gt|   for g in gt
-    #   Precision = Σ best_match(u, gt)   / |used|  for u in used
-    #   F1        = 2 * P * R / (P + R)
-    # ------------------------------------------------------------------
     per_episode_recall = []
     per_episode_precision = []
     per_episode_f1 = []
@@ -705,7 +593,6 @@ def compute_metrics(results: List[Dict], augmented_tools: List[Dict]) -> Dict:
     for r in results:
         gt = set(_normalize_tool_name(t) for t in r.get("gt_tools", []))
 
-        # Collect all atomic tools used (expanding skills via traces)
         all_atomic_used = set()
         for a in r.get("actions", []):
             aname = _normalize_tool_name(a.get("name", ""))
@@ -719,66 +606,25 @@ def compute_metrics(results: List[Dict], augmented_tools: List[Dict]) -> Dict:
                 all_atomic_used.add(_normalize_tool_name(tool_name))
 
         if gt and all_atomic_used:
-            # Recall: for each gt tool, find best match in used
             recall_credit = 0.0
             for g in gt:
                 best = max(_fuzzy_match_score(g, ut) for ut in all_atomic_used)
                 recall_credit += best
             recall = min(recall_credit / len(gt), 1.0)
 
-            # Precision: for each used tool, find best match in gt
             precision_credit = 0.0
             for ut in all_atomic_used:
                 best = max(_fuzzy_match_score(ut, g) for g in gt)
                 precision_credit += best
             precision = min(precision_credit / len(all_atomic_used), 1.0)
 
-            # F1
             if precision + recall > 0:
                 f1 = 2 * precision * recall / (precision + recall)
             else:
                 f1 = 0.0
 
-            # --- [Optional] Order-aware coverage (commented out for future use) ---
-            # To re-enable: uncomment and use order_coverage instead of / alongside f1
-            #
-            # gt_list = [_normalize_tool_name(t) for t in r.get("gt_tools", [])]
-            # used_list = [_normalize_tool_name(a.get("name", "")) for a in r.get("actions", [])]
-            # gt_match_positions = []
-            # for gi, gtool in enumerate(gt_list):
-            #     best_score = 0.0
-            #     best_ui = -1
-            #     for ui, ut in enumerate(used_list):
-            #         score = _fuzzy_match_score(gtool, ut)
-            #         if score > best_score:
-            #             best_score = score
-            #             best_ui = ui
-            #         if best_score == 1.0:
-            #             break
-            #     if best_score > 0:
-            #         gt_match_positions.append((gi, best_ui, best_score))
-            #
-            # if len(gt_match_positions) >= 2:
-            #     import bisect
-            #     pos_seq = [ui for _, ui, _ in gt_match_positions]
-            #     tails = []
-            #     for p in pos_seq:
-            #         idx = bisect.bisect_left(tails, p)
-            #         if idx == len(tails):
-            #             tails.append(p)
-            #         else:
-            #             tails[idx] = p
-            #     order_bonus = len(tails) / len(gt_match_positions)
-            # elif len(gt_match_positions) == 1:
-            #     order_bonus = 1.0
-            # else:
-            #     order_bonus = 0.0
-            #
-            # order_coverage = recall * (0.7 + 0.3 * order_bonus)
-            # --- End optional order-aware coverage ---
 
         elif not gt:
-            # No ground truth — skip this episode (don't inflate scores)
             continue
         else:
             recall = 0.0
@@ -790,24 +636,15 @@ def compute_metrics(results: List[Dict], augmented_tools: List[Dict]) -> Dict:
         per_episode_f1.append(f1)
         per_episode_tool_counts.append(r.get("decision_steps", 0))
 
-    n_valid = len(per_episode_f1)  # episodes with valid gt (excludes empty gt)
+    n_valid = len(per_episode_f1)
     avg_recall = sum(per_episode_recall) / n_valid if n_valid > 0 else 0
     avg_precision = sum(per_episode_precision) / n_valid if n_valid > 0 else 0
     avg_f1 = sum(per_episode_f1) / n_valid if n_valid > 0 else 0
     avg_tool_calls = sum(per_episode_tool_counts) / n_valid if n_valid > 0 else 0
 
-    # Progress rate: fraction of episodes with any correct tool match
     progress_episodes = sum(1 for f in per_episode_f1 if f > 0)
     progress_rate = progress_episodes / n_valid if n_valid > 0 else 0
 
-    # ------------------------------------------------------------------
-    # KEY METRIC 2: Next-tool Prediction Accuracy
-    #
-    # For each step i in the episode, check if the tool called at step i
-    # matches gt_tools[i] (positional). This measures whether the model
-    # predicts the correct *next* tool at each decision point.
-    #   next_tool_acc = correct_steps / total_steps  (micro-averaged)
-    # ------------------------------------------------------------------
     next_tool_correct = 0
     next_tool_total = 0
 
@@ -817,18 +654,15 @@ def compute_metrics(results: List[Dict], augmented_tools: List[Dict]) -> Dict:
 
         for step_i, action in enumerate(actions):
             if step_i >= len(gt_list):
-                break  # no more gt to compare
+                break
 
-            # Expand skill to its first atomic tool for comparison
             aname = _normalize_tool_name(action.get("name", ""))
-            # If the action is a skill, also consider its constituent atomic tools
             candidates = {aname}
             if aname in skill_chains:
                 for atomic_t in skill_chains[aname]:
                     candidates.add(_normalize_tool_name(atomic_t))
 
             gt_tool = gt_list[step_i]
-            # Check if any candidate fuzzy-matches the gt tool at this position
             best_score = max(_fuzzy_match_score(c, gt_tool) for c in candidates)
             if best_score >= 0.5:
                 next_tool_correct += 1
@@ -836,10 +670,6 @@ def compute_metrics(results: List[Dict], augmented_tools: List[Dict]) -> Dict:
 
     next_tool_acc = next_tool_correct / next_tool_total if next_tool_total > 0 else 0.0
 
-    # ------------------------------------------------------------------
-    # Auxiliary metrics
-    # ------------------------------------------------------------------
-    # Skills actually used (normalize for consistent matching)
     norm_skills_available = {}
     for s in skills_available:
         ns = s.lower().replace("-", "_").replace(".", "_")
@@ -857,14 +687,12 @@ def compute_metrics(results: List[Dict], augmented_tools: List[Dict]) -> Dict:
                 if na in norm_skills_available:
                     skills_used.add(norm_skills_available[na])
 
-    # Interrupt position distribution
     all_interrupt_pos = []
     for r in results:
         all_interrupt_pos.extend(r.get("interrupt_positions", []))
     interrupt_dist = Counter(all_interrupt_pos)
 
     metrics = {
-        # === KEY METRICS (reported in paper) ===
         "tool_f1": round(avg_f1, 4),
         "tool_recall": round(avg_recall, 4),
         "tool_precision": round(avg_precision, 4),
@@ -872,7 +700,6 @@ def compute_metrics(results: List[Dict], augmented_tools: List[Dict]) -> Dict:
         "skill_usage_ratio": round(total_skill_calls / max(total_decisions, 1), 4),
         "avg_decision_steps": round(total_decisions / n, 2) if n > 0 else 0,
         "avg_atomic_calls": round(total_atomic / n, 2) if n > 0 else 0,
-        # === Auxiliary (for reference) ===
         "num_episodes": n,
         "num_episodes_valid": n_valid,
         "avg_tool_calls": round(avg_tool_calls, 2),
@@ -893,10 +720,6 @@ def compute_metrics(results: List[Dict], augmented_tools: List[Dict]) -> Dict:
     return metrics
 
 
-# ============================================================================
-# Main
-# ============================================================================
-
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="AdaMacro Step 5: Evaluation")
@@ -915,7 +738,6 @@ def main():
 
     eval_config = EvalConfig(max_turns=args.max_turns, max_atomic_calls=args.max_atomic_calls)
 
-    # Determine LoRA path based on stage
     if args.lora_path is None:
         if args.stage == "sft":
             args.lora_path = os.path.join(CHECKPOINT_DIR, "sft", args.model)
@@ -924,7 +746,6 @@ def main():
         else:
             args.lora_path = None
 
-    # Output path
     if args.output is None:
         os.makedirs(EVAL_RESULTS_DIR, exist_ok=True)
         args.output = os.path.join(

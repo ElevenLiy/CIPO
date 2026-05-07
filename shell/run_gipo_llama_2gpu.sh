@@ -11,34 +11,11 @@
 #SBATCH --error=logs/gipo_llama8b_2gpu_%j.err
 #SBATCH --partition=fengl2
 
-# ===========================================================================
-# GIPO 2-GPU Experiment for LLaMA 3.1-8B
-# ===========================================================================
-# Uses model parallelism (device_map="auto"), NOT DDP/torchrun.
-# GIPO rollouts are serial, so we split the model across 2 GPUs for memory.
-# Uses GIPO7BConfig (lr=2e-6, lora_rank=32, gradient checkpointing).
-#
-# Checkpoint directory:  checkpoints/gipo_2gpu_llama31_8b/
-# Eval directory:        eval_gipo_2gpu_llama31_8b_results/
-#
-# Usage:
-#   sbatch run_gipo_llama_2gpu.sh                              # Default: SFT + GIPO + eval
-#   sbatch run_gipo_llama_2gpu.sh llama3.1-8b 4,5              # GIPO training + eval only (if SFT already done)
-#   sbatch run_gipo_llama_2gpu.sh llama3.1-8b 1,2,3,4,5        # Full pipeline from scratch
-#   sbatch run_gipo_llama_2gpu.sh llama3.1-8b 5 sft            # Evaluate SFT only
-#
-# NOTE: Steps 1-2 (BPE mining + Skill instantiation) are model-agnostic and
-#       shared across all pipelines. Only run them if not done before.
-#       Step 3 (SFT) checkpoint is shared at checkpoints/sft/llama3.1-8b/.
-#       Only re-run Step 3 if SFT hasn't been trained for this model yet.
-# ===========================================================================
 
-# --- Parameters ---
 MODEL=${1:-"llama3.1-8b"}
 STEPS=${2:-"3,4,5"}
 STAGE=${3:-"grpo"}
 
-# --- Project paths ---
 ADAMACRO_DIR="/path/to/CIPO"
 cd ${ADAMACRO_DIR}
 
@@ -56,13 +33,9 @@ echo "Stage:      ${STAGE}"
 echo "Time:       $(date)"
 echo "============================================================"
 
-# --- Environment setup ---
 source $CONDA_PREFIX/etc/profile.d/conda.sh
 conda activate tool
 
-# --- Run GIPO 2-GPU pipeline ---
-# NOTE: Using plain python, NOT torchrun. Model parallelism is handled
-# inside the script via device_map="auto" and accelerate.
 python scripts/run_pipeline_gipo_llama_2gpu.py \
     --model ${MODEL} \
     --steps ${STEPS} \

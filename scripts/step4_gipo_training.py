@@ -1,51 +1,3 @@
-"""
-AdaMacro Step 4: GIPO Training (Granularity-Imagination Policy Optimization)
-=============================================================================
-
-GIPO extends GRPO with per-step counterfactual imagination:
-
-At each tool-calling step, if the model's chosen action has an alternative
-at a different granularity level (atomic ↔ skill), GIPO simulates the
-counterfactual action in the tool environment and compares immediate
-gt_tools coverage. This produces a dense **process-level reward** signal
-(R_imagination) that teaches the model *when* to use skills vs atomic tools.
-
-Key mechanism:
-  - Model calls atomic tool X → check if a skill containing X exists
-    → simulate skill → compare coverage → process reward for this step
-  - Model calls skill S → check first atomic tool in S's chain
-    → simulate atomic → compare coverage → process reward for this step
-  - Process reward is accumulated across all eligible steps in a rollout
-
-Training process overview:
-==========================
-
-Each "step" in the log = 1 optimizer update, which processes (grad_accum × prompts).
-
-For EACH training prompt:
-  Phase 1: Generate 2 base rollouts (base_0 with skill-biased prompt, base_1 with neutral prompt).
-     Each rollout = model interacts with environment step-by-step:
-       turn 0: model generates → parse tool_call → env.execute → get tool_response
-       turn 1: model sees history + tool_response → generates next tool_call → env.execute
-       ...
-       turn N: model generates text (no tool_call) → episode done
-     At each tool-calling step, if an alternative granularity exists (atomic↔skill),
-     fork a counterfactual branch with parameter-mapped arguments.
-     Branch count is 0-2 → total group size is dynamic (2-4 rollouts).
-  Phase 1.5: Compute R_imagination for each (base, branch) pair:
-     Δ = R_branch - R_base → symmetric reward bonus scaled by gipo_step_reward_scale,
-     clipped by gipo_step_reward_cap and gipo_total_reward_cap.
-  Phase 2: Compute reward, group-normalize → advantage (positive = better than group mean)
-  Phase 3: Policy gradient: loss = advantage × cross_entropy(assistant_tokens_only)
-  Accumulate gradients for grad_accum prompts → optimizer.step()  ← this is 1 "step"
-
-Reward:
-  R = R_task + skill_bonus + R_efficiency + R_imagination
-  R_task:        gt tools coverage (exact + fuzzy name matching)
-  skill_bonus:   additive reward when skills genuinely helped
-  R_eff:         bonus for fewer decision steps
-  R_imagination: process reward from counterfactual granularity comparison (GIPO)
-"""
 
 import json
 import copy
@@ -71,27 +23,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# Execution Logger: saves detailed per-step records to JSON
-# ============================================================================
-
 class ExecutionLogger:
-    """
-    Saves detailed training execution records to a JSON-lines file.
-    Each line = one prompt's complete rollout group.
-    """
     def __init__(self, log_path: str):
         self.log_path = log_path
         self.records = []
-        # Write header
         with open(log_path, "w") as f:
-            f.write("")  # clear
+            f.write("")
         logger.info(f"Execution log → {log_path}")
 
     def log_prompt(self, epoch: int, prompt_idx: int, global_step: int,
                    user_prompt: str, gt_tools: List[str],
                    rollouts: List[Dict]):
-        """Log one prompt's complete training record."""
         record = {
             "epoch": epoch,
             "prompt_idx": prompt_idx,
@@ -111,10 +53,8 @@ class ExecutionLogger:
                 "reward": round(r["reward"], 4),
                 "advantage": round(r["advantage"], 4),
                 "reward_breakdown": r.get("reward_breakdown", {}),
-                # Per-turn action log
                 "turns": [],
             }
-            # Extract turn-by-turn actions from messages
             for i, (tool_name, args) in enumerate(r["actions"]):
                 turn_info = {
                     "turn": i,
@@ -124,9 +64,7 @@ class ExecutionLogger:
                 }
                 rollout_record["turns"].append(turn_info)
 
-            # If model just output text without any tool call
             if r["num_steps"] == 0:
-                # Get the final text response
                 msgs = r.get("messages", [])
                 for m in reversed(msgs):
                     if m.get("role") == "assistant":
@@ -137,8 +75,6 @@ class ExecutionLogger:
 
         self.records.append(record)
 
-        # Append to file (JSON-lines format)
-        # Clean surrogates from model output before serialization
         def _clean_surrogates(obj):
             if isinstance(obj, str):
                 return obj.encode("utf-8", errors="replace").decode("utf-8")
@@ -152,7 +88,6 @@ class ExecutionLogger:
             f.write(json.dumps(_clean_surrogates(record), ensure_ascii=False) + "\n")
 
     def save_summary(self):
-        """Save a human-readable summary at the end."""
         summary_path = self.log_path.replace(".jsonl", "_summary.json")
         total = len(self.records)
         if total == 0:
@@ -186,7 +121,6 @@ class ExecutionLogger:
 
 
 def _truncate_args(args: Dict, max_len: int = 100) -> Dict:
-    """Truncate arg values for readable logging."""
     if not isinstance(args, dict):
         return {}
     out = {}
@@ -196,36 +130,15 @@ def _truncate_args(args: Dict, max_len: int = 100) -> Dict:
     return out
 
 
-# ============================================================================
-# Reward
-# ============================================================================
-
 class AdaMacroReward:
-    """
-    R(τ) = R_task + skill_bonus + R_efficiency
-
-    Core insight:
-      R_task (gt_tools coverage) is THE task-completion proxy.
-      skill_bonus is a small ADDITIVE reward when skills helped cover gt_tools.
-      If r_task=0, no amount of skill usage helps — this prevents collapse.
-
-    Gradient:
-      high_coverage + skill(~1.5) > high_coverage + atomic(1.0) > low_coverage + skill(0.3) > nothing(0)
-
-    The multiplier ensures:
-      - "right skill, right task" → r_task is high AND gets multiplied → best reward
-      - "wrong skill, any task"  → r_task stays low, multiplier on low base → low reward  
-      - "right atomic, no skill" → r_task is high, no multiplier → good but not best
-    """
     def __init__(self, config: GRPOConfig, skill_definitions: Dict = None):
-        self.lambda_skill = config.lambda_skill    # 0.3
+        self.lambda_skill = config.lambda_skill
         self.skill_chains = {}
         if skill_definitions:
             for sname, sdef in skill_definitions.items():
                 chain = sdef.get("tool_chain", [])
                 if not chain:
                     chain = [s.get("tool_name", "") for s in sdef.get("execution_plan", [])]
-                # Normalize chain tool names
                 self.skill_chains[sname] = [normalize_tool_name(t) for t in chain]
 
     def compute(
@@ -241,38 +154,24 @@ class AdaMacroReward:
         max_steps: int,
     ) -> Tuple[float, Dict]:
 
-        # ==============================================================
-        # R_task: tool overlap with ground truth (0 ~ 1.0)
-        #
-        # Matching levels:
-        #   1. Exact match → 1.0 credit
-        #   2. Substring match (after normalization) → 0.8 credit
-        #   3. Token Jaccard ≥ 0.5 → jaccard_score credit
-        # ==============================================================
-        # Normalize all tool names to strip version suffixes
         all_used = set(normalize_tool_name(t) for t in used_tools)
         for trace in skill_traces:
             for tool_name, _ in trace:
                 all_used.add(normalize_tool_name(tool_name))
         gt_set = set(normalize_tool_name(t) for t in gt_tools) if gt_tools else set()
-        # Preserve ordered lists for position-aware scoring
         gt_list = [normalize_tool_name(t) for t in gt_tools] if gt_tools else []
         used_list = [normalize_tool_name(t) for t in used_tools]
-        # Also append tools from skill traces in order
         for trace in skill_traces:
             for tool_name, _ in trace:
                 used_list.append(normalize_tool_name(tool_name))
 
         def _tokenize_tool(name: str) -> set:
-            """Split tool name into tokens for Jaccard comparison."""
             n = name.lower().replace("-", "_").replace(".", "_")
-            # Remove version suffixes like _v1, _v2
             import re as _re
             n = _re.sub(r'_v\d+$', '', n)
             return set(t for t in n.split("_") if len(t) >= 2)
 
         def _fuzzy_match_score(a: str, b: str) -> float:
-            """Return match score between two tool names (0~1)."""
             a_n = a.lower().replace("-", "_").replace(".", "_")
             b_n = b.lower().replace("-", "_").replace(".", "_")
             if a_n == b_n or a == b:
@@ -304,10 +203,7 @@ class AdaMacroReward:
 
             base_coverage = min(total_credit / max(len(gt_set), 1), 1.0)
 
-            # ---- Position-aware order bonus ----
-            # Build matched position pairs: for each gt tool (in order),
-            # find its best match position in used_list
-            gt_match_positions = []  # (gt_index, used_index, score)
+            gt_match_positions = []
             for gi, gt in enumerate(gt_list):
                 best_score = 0.0
                 best_ui = -1
@@ -321,12 +217,8 @@ class AdaMacroReward:
                 if best_score > 0:
                     gt_match_positions.append((gi, best_ui, best_score))
 
-            # Compute LCS length on the used_list positions to measure order preservation
             if len(gt_match_positions) >= 2:
-                # Extract the used_list positions of matched gt tools (in gt order)
                 pos_seq = [ui for _, ui, _ in gt_match_positions]
-                # LCS of pos_seq with its sorted version = longest increasing subsequence
-                # Use patience sorting for O(n log n) LIS
                 import bisect
                 tails = []
                 for p in pos_seq:
@@ -342,8 +234,6 @@ class AdaMacroReward:
             else:
                 order_bonus = 0.0
 
-            # Final r_task: coverage weighted by order quality
-            # 70% from coverage, 30% bonus for correct ordering
             r_task = base_coverage * (0.7 + 0.3 * order_bonus)
 
             if r_task == 0.0 and completed:
@@ -355,7 +245,6 @@ class AdaMacroReward:
         else:
             r_task = 0.0
 
-        # 0-step penalty
         if num_decision_steps == 0:
             return 0.0, {
                 "r_task": 0.0, "skill_bonus": 0.0, "r_efficiency": 0.0,
@@ -363,33 +252,22 @@ class AdaMacroReward:
                 "tools_used": [], "note": "0-step penalty",
             }
 
-        # ==============================================================
-        # Skill bonus: small ADDITIVE reward when skills genuinely helped
-        #
-        # Design: skill bonus is additive (not multiplicative) to avoid
-        # compounding bias that causes skill-only collapse.
-        # Max skill bonus ≈ +0.1, compared to r_task range [0, 1].
-        # Irrelevant skill calls receive a penalty.
-        # ==============================================================
         skill_bonus = 0.0
         n_skill_ok = 0
         n_skill_relevant = 0
         n_skill_irrelevant = 0
 
         if skill_traces and skill_names:
-            # Track unique skills already counted (no stacking from repeated calls)
             seen_skills = set()
 
             for i, trace in enumerate(skill_traces):
                 sname = skill_names[i] if i < len(skill_names) else ""
 
-                # Skip duplicate skill calls — same skill called again adds nothing
                 if sname in seen_skills:
                     continue
 
                 chain = self.skill_chains.get(sname, [])
 
-                # How many gt_tools does this skill's chain cover? (with fuzzy matching)
                 chain_coverage = 0.0
                 if gt_set and chain:
                     chain_credit = 0.0
@@ -416,7 +294,6 @@ class AdaMacroReward:
                 all_ok = all(s == "success" for _, s in trace)
 
                 if chain_coverage > 0 and all_ok:
-                    # Additive bonus: max 0.1 per relevant skill (capped below)
                     this_bonus = 0.05 + 0.05 * chain_coverage
                     skill_bonus += this_bonus
                     n_skill_ok += 1
@@ -430,56 +307,37 @@ class AdaMacroReward:
                     n_skill_relevant += 1
                     seen_skills.add(sname)
                 elif chain_coverage == 0 and chain:
-                    # PENALTY: skill chain has zero overlap with gt_tools
-                    # Calling an irrelevant skill wastes steps and should be discouraged
                     skill_bonus -= 0.05
                     n_skill_irrelevant += 1
                     seen_skills.add(sname)
 
-            # Cap total skill bonus to prevent stacking
             skill_bonus = max(-0.15, min(skill_bonus, 0.1))
 
-            # Penalize repeated skill calls (same skill called N>1 times)
-            # Count total skill calls vs unique skills
             if num_skill_calls > len(seen_skills) and len(seen_skills) > 0:
                 repeat_count = num_skill_calls - len(seen_skills)
-                skill_bonus -= 0.03 * repeat_count  # -0.03 per repeated call
+                skill_bonus -= 0.03 * repeat_count
                 skill_bonus = max(skill_bonus, -0.15)
 
-        # ==============================================================
-        # R_efficiency: fewer decision steps (gated by coverage quality)
-        # ==============================================================
         r_eff = 0.0
         if completed and num_decision_steps > 0:
-            # Gate: only grant efficiency bonus when task is reasonably solved
             if r_task >= 0.4:
                 r_eff += max(0, 1 - num_decision_steps / max_steps) * 0.15 * r_task
-                # Compression bonus: ONLY when skills were actually used
-                # Without this gate, early stopping gets free efficiency points
                 if gt_tools and num_decision_steps < len(gt_tools) and num_skill_calls > 0:
                     r_eff += (len(gt_tools) - num_decision_steps) * 0.05
 
-        # Under-exploration penalty: punish very short rollouts with low coverage
         if num_decision_steps < 3 and r_task < 0.3:
             r_eff -= 0.05 * (3 - num_decision_steps)
 
-        # ==============================================================
-        # Total: r_task + skill_bonus + efficiency + imagination (GIPO)
-        # In GIPO, imagination signal comes from counterfactual branches
-        # added directly to the GRPO group, not as a reward modifier.
-        # ==============================================================
         total = r_task + skill_bonus + r_eff
-        # Clamp to non-negative: negative rewards destabilize GRPO advantage
         total = max(total, 0.0)
 
-        # Safely get order_bonus (may not be defined if gt_set is empty)
         _order_bonus = order_bonus if (gt_set and all_used) else 0.0
 
         breakdown = {
             "r_task": round(r_task, 4),
             "skill_bonus": round(skill_bonus, 4),
             "r_efficiency": round(r_eff, 4),
-            "r_imagination": 0.0,  # placeholder; imagination signal via GRPO group
+            "r_imagination": 0.0,
             "order_bonus": round(_order_bonus, 4),
             "n_skill_ok": n_skill_ok,
             "n_skill_relevant": n_skill_relevant,
@@ -490,20 +348,7 @@ class AdaMacroReward:
         return total, breakdown
 
 
-# ============================================================================
-# Tool Environment
-# ============================================================================
-
 class ToolEnvironment:
-    """
-    Wraps tool_simulator_database + SkillInterpreter.
-    
-    Parameter matching: 4-level fallback
-      1. Exact match in DB
-      2. Key-overlap match
-      3. Most-frequent call from rl_dataset
-      4. Generic response
-    """
     def __init__(self, augmented_tools_path: str, tool_sim_db_path: str,
                  rl_dataset_path: str = None):
         with open(augmented_tools_path, "r") as f:
@@ -529,7 +374,6 @@ class ToolEnvironment:
             from step2_skill_instantiation import SkillInterpreter
         self.interpreter = SkillInterpreter(self.tool_sim_db)
 
-        # Build indexes
         self.tool_freq_index = {}
         self.tool_calls_index = {}
         if rl_dataset_path and os.path.exists(rl_dataset_path):
@@ -606,19 +450,15 @@ class ToolEnvironment:
         if not isinstance(arguments, dict):
             arguments = {}
 
-        # Try exact match first, then normalized name fallback
-        # Model may generate "excel-format_range" but DB has "excel-format_range_v13"
         resolved_name = tool_name
         if (tool_name not in self.skills and tool_name not in self.atomic_tools
                 and tool_name not in self.tool_calls_index):
             norm = normalize_tool_name(tool_name)
-            # Search for a DB entry whose normalized name matches
             for orig in list(self.all_tool_names) + list(self.tool_calls_index.keys()):
                 if normalize_tool_name(orig) == norm:
                     resolved_name = orig
                     break
 
-        # Check if resolved tool_name is known AT ALL
         is_known = (resolved_name in self.skills or resolved_name in self.atomic_tools
                     or resolved_name in self.all_tool_names
                     or resolved_name in self.tool_calls_index
@@ -648,7 +488,6 @@ class ToolEnvironment:
                 "atomic_cost": 1,
             }
         else:
-            # UNKNOWN tool: return error, mark as failure
             return {
                 "output": json.dumps({"error": f"Unknown tool: {tool_name}"}),
                 "is_skill": False,
@@ -659,32 +498,12 @@ class ToolEnvironment:
             }
 
 
-# ============================================================================
-# Action parsing
-# ============================================================================
-
 def normalize_tool_name(name: str) -> str:
-    """Strip version suffixes like _v1, _v13, _v2beta from tool names.
-    
-    The version suffix is only relevant for DB parameter lookup, not for
-    the model's tool selection. Keeping it increases vocabulary and makes
-    generalization harder.
-    
-    Examples:
-        excel-format_range_v13 → excel-format_range
-        google_maps_geocode_v1 → google_maps_geocode
-        canvas-canvas_create_quiz → canvas-canvas_create_quiz (no change)
-    """
     import re as _re
     return _re.sub(r'_v\d+\w*$', '', name)
 
 
 def find_best_matching_skill(gt_tools: List[str], skills: Dict[str, Dict]) -> Optional[str]:
-    """Find the skill whose tool_chain has maximum overlap with gt_tools.
-
-    Returns the skill name with the highest coverage (at least 1 overlapping
-    tool), or None if no skill matches any gt_tool.
-    """
     if not gt_tools or not skills:
         return None
 
@@ -705,10 +524,6 @@ def find_best_matching_skill(gt_tools: List[str], skills: Dict[str, Dict]) -> Op
     return best_skill if best_coverage > 0 else None
 
 
-# ============================================================================
-# GIPO: Counterfactual Granularity Imagination
-# ============================================================================
-
 def find_counterfactual_action(
     chosen_tool: str,
     is_skill: bool,
@@ -716,36 +531,19 @@ def find_counterfactual_action(
     skill_chains: Dict[str, List[str]],
     original_arguments: Dict = None,
 ) -> Optional[Dict]:
-    """
-    Given the model's chosen action, find the counterfactual at a different
-    granularity level, with proper parameter mapping.
-
-    - If model chose an atomic tool → find a skill whose chain contains it
-    - If model chose a skill → return the first atomic tool in its chain
-
-    Parameter mapping ensures the counterfactual gets meaningful arguments
-    instead of empty {}, making the comparison fair.
-
-    Returns: {"name": str, "arguments": dict, "is_skill": bool, "reason": str}
-             or None if no counterfactual exists.
-    """
     chosen_norm = normalize_tool_name(chosen_tool)
     orig_args = original_arguments or {}
 
     if is_skill:
-        # Model chose a skill → counterfactual is its first atomic tool
         chain = skill_chains.get(chosen_tool, [])
         skill_key = chosen_tool
         if not chain:
-            # Try normalized name lookup
             for sname, schain in skill_chains.items():
                 if normalize_tool_name(sname) == chosen_norm and schain:
                     chain = schain
                     skill_key = sname
                     break
         if chain:
-            # Map skill's exposed params → first atomic tool's params
-            # execution_plan[i]["params_source"][param] = {"type": "exposed", "param_name": X}
             cf_args = {}
             skill_def = skills.get(skill_key)
             if skill_def and orig_args:
@@ -757,7 +555,6 @@ def find_counterfactual_action(
                             exposed_name = pinfo.get("param_name", pname)
                             if exposed_name in orig_args:
                                 cf_args[pname] = orig_args[exposed_name]
-                # Fallback: if exec_plan didn't help, try direct name match
                 if not cf_args:
                     for k, v in orig_args.items():
                         cf_args[k] = v
@@ -768,25 +565,20 @@ def find_counterfactual_action(
                 "reason": f"atomic_alternative_for_{chosen_norm}",
             }
     else:
-        # Model chose atomic tool → find a skill containing it
         best_skill = None
         best_chain_len = float("inf")
         for sname, schain in skill_chains.items():
             chain_norm = [normalize_tool_name(t) for t in schain]
             if chosen_norm in chain_norm:
-                # Prefer shorter chains (more specific skills)
                 if len(schain) < best_chain_len:
                     best_chain_len = len(schain)
                     best_skill = sname
         if best_skill:
-            # Map atomic tool's params → skill's exposed params
-            # execution_plan[i]["params_source"][param] = {"type": "exposed", "param_name": X}
             cf_args = {}
             skill_def = skills.get(best_skill)
             if skill_def and orig_args:
                 exec_plan = skill_def.get("execution_plan", [])
                 chain = skill_chains.get(best_skill, [])
-                # Find chosen_tool's position in the chain
                 chosen_idx = None
                 for ci, ct in enumerate(chain):
                     if normalize_tool_name(ct) == chosen_norm:
@@ -799,7 +591,6 @@ def find_counterfactual_action(
                             exposed_name = pinfo.get("param_name", pname)
                             if pname in orig_args:
                                 cf_args[exposed_name] = orig_args[pname]
-                # Fallback: if mapping didn't help, try direct name match
                 if not cf_args:
                     exposed = skill_def.get("exposed_params", [])
                     for k, v in orig_args.items():
@@ -830,23 +621,10 @@ def run_imagination_branch(
     prefix_skill_traces: List[List[Tuple[str, str]]] = None,
     prefix_skill_names: List[str] = None,
 ) -> Dict:
-    """
-    Run a counterfactual imagination branch from a decision point.
-
-    Takes the message history up to (but not including) the branching step,
-    executes the counterfactual tool, then lets the model continue generating
-    from the modified history to produce a complete alternative trajectory.
-
-    This produces a full rollout whose reward can be compared with the original
-    to determine if the model's granularity choice was correct.
-
-    Returns: same format as run_rollout (with messages, actions, reward fields etc.)
-    """
     import torch
 
     TOOL_CALL_PREFIX = '<tool_call>\n{"name": "'
 
-    # Extract available tool names from system prompt (first message)
     _available_tools = []
     if prefix_messages and prefix_messages[0]["role"] == "system":
         for line in prefix_messages[0]["content"].split("\n"):
@@ -857,10 +635,8 @@ def run_imagination_branch(
                     tname = tname[7:]
                 if tname and len(tname) < 60:
                     _available_tools.append(tname)
-    _available_tools_set = set(_available_tools)  # for O(1) lookup in salvage
+    _available_tools_set = set(_available_tools)
 
-    # Start from prefix (messages before the branching step)
-    # Inherit skill info from prefix to ensure fair reward comparison
     messages = [dict(m) for m in prefix_messages]
     actions = list(prefix_actions)
     skill_traces = list(prefix_skill_traces) if prefix_skill_traces else []
@@ -868,7 +644,6 @@ def run_imagination_branch(
     total_atomic = prefix_total_atomic if prefix_total_atomic > 0 else len(actions)
     completed = False
 
-    # Execute the counterfactual tool as the branching action
     if len(cf_tool_name) > 60 or " " in cf_tool_name:
         return _empty_branch_result(messages, actions, temperature,
                                     prefix_skill_traces=skill_traces,
@@ -889,7 +664,6 @@ def run_imagination_branch(
     messages.append({"role": "user",
                      "content": f"<tool_response name=\"{cf_tool_name}\">\n{obs}\n</tool_response>"})
 
-    # Continue generating from the modified history
     min_forced_steps = min(max(3, gt_tools_len // 2), 6) if gt_tools_len > 0 else 3
     remaining_turns = max_turns - len(actions)
 
@@ -906,7 +680,6 @@ def run_imagination_branch(
         if len(prompt) > 50000:
             prompt = prompt[:50000]
 
-        # Use same forced/free logic as run_rollout
         if len(actions) < min_forced_steps:
             forced_prompt = prompt + TOOL_CALL_PREFIX
             try:
@@ -965,7 +738,6 @@ def run_imagination_branch(
                 completed = True
                 break
 
-        # Execute tool
         tool_name = tool_call["name"]
         arguments = tool_call["arguments"]
         if not isinstance(arguments, dict):
@@ -1009,7 +781,6 @@ def run_imagination_branch(
 def _empty_branch_result(messages, actions, temperature,
                          prefix_skill_traces=None, prefix_skill_names=None,
                          prefix_total_atomic=0):
-    """Return a minimal result when branch cannot be executed."""
     _traces = list(prefix_skill_traces) if prefix_skill_traces else []
     _names = list(prefix_skill_names) if prefix_skill_names else []
     return {
@@ -1027,7 +798,6 @@ def _empty_branch_result(messages, actions, temperature,
 
 
 def _extract_balanced_json(text: str) -> Optional[str]:
-    """Extract the first balanced JSON object from text (handles nested braces)."""
     start = text.find('{')
     if start < 0:
         return None
@@ -1043,7 +813,6 @@ def _extract_balanced_json(text: str) -> Optional[str]:
 
 
 def parse_tool_call(response: str) -> Optional[Dict]:
-    # Priority 1: <tool_call> tags (handles nested JSON correctly)
     tc = re.search(r'<tool_call>\s*(.*?)\s*</tool_call>', response, re.DOTALL)
     if tc:
         try:
@@ -1051,7 +820,6 @@ def parse_tool_call(response: str) -> Optional[Dict]:
             if isinstance(obj, dict) and "name" in obj:
                 return {"name": str(obj["name"]), "arguments": obj.get("arguments", {})}
         except (json.JSONDecodeError, TypeError, AttributeError):
-            # Tag found but JSON malformed — try balanced extraction inside tag
             balanced = _extract_balanced_json(tc.group(1))
             if balanced:
                 try:
@@ -1061,7 +829,6 @@ def parse_tool_call(response: str) -> Optional[Dict]:
                 except (json.JSONDecodeError, TypeError, AttributeError):
                     pass
 
-    # Priority 2: find JSON with "name" key using balanced brace matching
     name_pos = re.search(r'\{\s*"name"\s*:', response)
     if name_pos:
         balanced = _extract_balanced_json(response[name_pos.start():])
@@ -1073,7 +840,6 @@ def parse_tool_call(response: str) -> Optional[Dict]:
             except (json.JSONDecodeError, TypeError, AttributeError):
                 pass
 
-    # Priority 3: entire response is JSON
     try:
         obj = json.loads(response.strip())
         if isinstance(obj, dict) and "name" in obj:
@@ -1081,7 +847,6 @@ def parse_tool_call(response: str) -> Optional[Dict]:
     except:
         pass
 
-    # Priority 4: tool_name\n{args} pattern
     fn = re.search(r'(\w[\w\-\.]+)\s*\n\s*(\{.*?\})', response, re.DOTALL)
     if fn:
         try:
@@ -1093,10 +858,6 @@ def parse_tool_call(response: str) -> Optional[Dict]:
     return None
 
 
-# ============================================================================
-# Single Rollout
-# ============================================================================
-
 def run_rollout(
     model, tokenizer, env: ToolEnvironment,
     system_prompt: str, user_prompt: str,
@@ -1105,26 +866,12 @@ def run_rollout(
     oracle_first_tool: str = None,
     gt_tools_len: int = 0,
 ) -> Dict:
-    """
-    Run a single rollout episode with GIPO counterfactual imagination.
-
-    Strategy: "free first, force if stuck"
-    - Every turn: let model generate freely (it may output tool_call or text)
-    - If model outputs tool_call → execute it, continue
-    - If model outputs text AND has ≥1 prior action → treat as task done (natural stop)
-    - If model outputs text AND has 0 actions → use forced prefix to guarantee ≥1 tool call
-
-    GIPO addition: after each tool execution, check if a counterfactual action
-    at a different granularity exists. If so, simulate it and compute a per-step
-    process reward based on gt_tools coverage difference.
-    """
     import torch
     if not hasattr(run_rollout, '_debug_count'):
         run_rollout._debug_count = 0
 
     TOOL_CALL_PREFIX = '<tool_call>\n{"name": "'
 
-    # Extract available tool names from system prompt for ultimate fallback
     _available_tools = []
     for line in system_prompt.split("\n"):
         line = line.strip()
@@ -1134,7 +881,7 @@ def run_rollout(
                 tname = tname[7:]
             if tname and len(tname) < 60:
                 _available_tools.append(tname)
-    _available_tools_set = set(_available_tools)  # for O(1) lookup in salvage
+    _available_tools_set = set(_available_tools)
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -1143,12 +890,11 @@ def run_rollout(
     actions = []
     skill_traces = []
     skill_names_used = []
-    continued_this_rollout = False  # at most 1 continuation nudge per rollout
+    continued_this_rollout = False
     total_atomic = 0
     completed = False
 
-    # GIPO: track message count before each action for branching
-    action_msg_offsets = []  # len(messages) right before each tool execution
+    action_msg_offsets = []
 
     for turn in range(max_turns):
         formatted = [{"role": m["role"], "content": m.get("content", "") or ""} for m in messages]
@@ -1165,26 +911,15 @@ def run_rollout(
         if len(prompt) > 50000:
             prompt = prompt[:50000]
 
-        # ==============================================================
-        # Turn routing:
-        #   actions < 2: forced prefix → must output tool
-        #   actions ≥ 2: free generation → can choose to stop
-        #
-        # This ensures every rollout tries at least 2 tools before
-        # deciding to stop, preventing the "1-tool-then-text" collapse.
-        # ==============================================================
         min_forced_steps = min(max(3, gt_tools_len // 2), 6) if gt_tools_len > 0 else 3
 
         if len(actions) < min_forced_steps:
-            # --- FORCED TURN: must output a tool ---
 
-            # Oracle mode on first turn only
             if oracle_first_tool is not None and len(actions) == 0:
                 tool_call = {"name": oracle_first_tool, "arguments": {}}
                 if run_rollout._debug_count < 20:
                     logger.info(f"    [oracle_seed] forced first tool: {oracle_first_tool}")
             else:
-                # Forced prefix generation
                 forced_prompt = prompt + TOOL_CALL_PREFIX
                 try:
                     inputs = tokenizer(forced_prompt, return_tensors="pt", truncation=True, max_length=3584)
@@ -1205,7 +940,6 @@ def run_rollout(
                 gen_ids = outputs[0][inputs["input_ids"].shape[-1]:]
                 completion = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
 
-                # Fallback if empty
                 if not completion and _available_tools:
                     import random as _rnd
                     completion = f'{_rnd.choice(_available_tools)}", "arguments": {{}}}}\n</tool_call>'
@@ -1217,12 +951,10 @@ def run_rollout(
                 full_response = TOOL_CALL_PREFIX + completion
                 tool_call = parse_tool_call(full_response)
 
-                # Salvage: only accept if the extracted name is a known tool
                 if tool_call is None:
                     name_match = re.match(r'^([a-zA-Z][\w\-\.]*)', completion)
                     if name_match and _available_tools_set:
                         candidate = name_match.group(1)
-                        # Only use the name if it's actually a known tool
                         if candidate in _available_tools_set:
                             tool_call = {"name": candidate, "arguments": {}}
                     if tool_call is None and _available_tools:
@@ -1233,7 +965,6 @@ def run_rollout(
                         break
 
         else:
-            # --- SUBSEQUENT TURNS: free generation ---
             try:
                 inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=3584)
             except (TypeError, ValueError):
@@ -1256,34 +987,27 @@ def run_rollout(
             tool_call = parse_tool_call(response)
 
             if tool_call is None:
-                # Model wants to stop — but check if it stopped too early
                 suggested_min = min_forced_steps + 1
                 if (len(actions) < suggested_min
                         and turn < max_turns - 1
                         and not continued_this_rollout):
-                    # Continuation nudge: tell the model to keep going
                     continued_this_rollout = True
                     messages.append({"role": "assistant", "content": response})
                     messages.append({
                         "role": "user",
                         "content": "You have not completed the task yet. Continue calling tools to finish."
                     })
-                    continue  # next iteration; forced/free branch will handle it
+                    continue
                 else:
-                    # Natural completion
                     messages.append({"role": "assistant", "content": response})
                     completed = True
                     break
 
-        # ==============================================================
-        # Step 3: Execute the tool call
-        # ==============================================================
         tool_name = tool_call["name"]
         arguments = tool_call["arguments"]
         if not isinstance(arguments, dict):
             arguments = {}
 
-        # Filter nonsense tool names
         if len(tool_name) > 60 or " " in tool_name or tool_name.startswith("http"):
             if len(actions) == 0:
                 completed = False
@@ -1291,7 +1015,6 @@ def run_rollout(
                 completed = True
             break
 
-        # GIPO: record message offset before this action (for branching)
         action_msg_offsets.append(len(messages))
 
         result = env.execute(tool_name, arguments)
@@ -1321,14 +1044,9 @@ def run_rollout(
         "total_atomic": total_atomic,
         "completed": completed,
         "temperature": temperature,
-        # GIPO: message offsets for each action (used by imagination branching)
         "action_msg_offsets": action_msg_offsets,
     }
 
-
-# ============================================================================
-# Tokenize with assistant-only label mask
-# ============================================================================
 
 def tokenize_with_assistant_mask(messages, tokenizer, max_length=4096):
     import torch
@@ -1385,10 +1103,6 @@ def tokenize_with_assistant_mask(messages, tokenizer, max_length=4096):
     return input_ids, attention_mask, labels
 
 
-# ============================================================================
-# Online GRPO Training
-# ============================================================================
-
 def train_grpo(
     model_name: str,
     sft_checkpoint_dir: str,
@@ -1400,7 +1114,6 @@ def train_grpo(
     from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
     from peft import PeftModel, LoraConfig, get_peft_model, TaskType
 
-    # ---------------------------------------------------------------- model
     model_path = get_model_path(model_name)
     logger.info(f"Loading base model: {model_path}")
 
@@ -1430,17 +1143,14 @@ def train_grpo(
     model.print_trainable_parameters()
     device = next(model.parameters()).device
 
-    # ---------------------------------------------------------------- env
     env = ToolEnvironment(AUGMENTED_TOOLS_PATH, TOOL_SIMULATOR_DB_PATH, RL_DATASET_PATH)
     reward_fn = AdaMacroReward(grpo_config, skill_definitions=env.skills)
 
-    # Build tool description matching SFT format (with parameters)
     with open(AUGMENTED_TOOLS_PATH, "r") as f:
         all_augmented_tools = json.load(f)
 
-    tool_desc_map = {}  # tool_name → description string
-    # Also build a mapping from normalized name → original name for DB lookup
-    norm_to_orig = {}  # normalized_name → original_name (for execute)
+    tool_desc_map = {}
+    norm_to_orig = {}
     for t in all_augmented_tools:
         orig_name = t["name"]
         norm_name = normalize_tool_name(orig_name)
@@ -1453,7 +1163,6 @@ def train_grpo(
                 param_names = list(props.keys())[:5]
                 param_str = f" params: {param_names}"
 
-        # For skills: show the tool chain so model knows what's inside
         chain_str = ""
         if t.get("is_skill"):
             chain = t.get("tool_chain", [])
@@ -1463,32 +1172,20 @@ def train_grpo(
                 norm_chain = [normalize_tool_name(c) for c in chain[:5]]
                 chain_str = f" [chain: {' → '.join(norm_chain)}]"
 
-        # Use normalized name in prompt (model sees clean names)
         tool_desc_map[norm_name] = f"- {tag}{norm_name}: {t.get('description','')[:100]}{chain_str}{param_str}"
-        # Keep mapping to original for DB lookup
         if norm_name not in norm_to_orig:
             norm_to_orig[norm_name] = orig_name
 
     def build_system_prompt(task_name: str) -> str:
-        """
-        Build per-prompt system prompt.
-        
-        NO gt_tools leak: we use task_name to pick a relevant tool CATEGORY
-        (e.g., "filesystem", "web") rather than the exact gt tools.
-        This avoids train/eval distribution mismatch.
-        """
         lines = []
         seen = set()
 
-        # Infer tool category from task_name (e.g., "filesystem_read_task" → "filesystem")
         task_lower = task_name.lower().replace("-", "_")
         category_keywords = set()
         for part in task_lower.split("_"):
             if len(part) >= 3:
                 category_keywords.add(part)
 
-        # Add skills first (always visible, core to AdaMacro)
-        # env.skills keys are original names, tool_desc_map keys are normalized
         norm_skill_names = set(normalize_tool_name(s) for s in env.skills)
         for tn, desc in tool_desc_map.items():
             if tn in norm_skill_names:
@@ -1497,7 +1194,6 @@ def train_grpo(
             if len(seen) >= 15:
                 break
 
-        # Add tools whose name matches task category keywords
         for tn, desc in tool_desc_map.items():
             if tn in seen:
                 continue
@@ -1508,7 +1204,6 @@ def train_grpo(
             if len(seen) >= 40:
                 break
 
-        # Fill remaining with random other tools
         other_tools = [tn for tn in tool_desc_map if tn not in seen]
         random.shuffle(other_tools)
         for tn in other_tools:
@@ -1535,7 +1230,6 @@ def train_grpo(
             "After receiving all tool responses, provide a brief text summary to finish."
         )
 
-    # ---------------------------------------------------------------- prompts
     with open(RL_DATASET_PATH, "r") as f:
         rl_data = json.load(f)
     episodes = rl_data.get("episodes", [])
@@ -1543,7 +1237,6 @@ def train_grpo(
     train_prompts = []
     for ep in episodes:
         if ep.get("success", 0) == 1 and ep.get("user_prompt") and ep.get("tool_names"):
-            # Normalize tool names (strip _v13 etc.) and deduplicate
             raw_gt = ep.get("tool_names", [])
             norm_gt = list(dict.fromkeys(normalize_tool_name(t) for t in raw_gt))
             train_prompts.append({
@@ -1553,7 +1246,6 @@ def train_grpo(
             })
     logger.info(f"Training prompts: {len(train_prompts)}")
 
-    # ---------------------------------------------------------------- hyper-params
     G = grpo_config.group_size
     num_epochs = grpo_config.num_epochs
     lr = grpo_config.learning_rate
@@ -1570,7 +1262,6 @@ def train_grpo(
         [p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=0.01)
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, max(total_steps, 1))
 
-    # ---------------------------------------------------------------- execution logger
     log_path = os.path.join(output_dir, "execution_log.jsonl")
     exec_logger = ExecutionLogger(log_path)
 
@@ -1581,10 +1272,9 @@ def train_grpo(
                 f"step_cap={grpo_config.gipo_step_reward_cap} "
                 f"total_cap={grpo_config.gipo_total_reward_cap}")
 
-    # ---------------------------------------------------------------- training loop
     global_step = 0
     acc_loss = acc_reward = acc_steps_ep = acc_skill_r = 0.0
-    acc_img_steps = 0.0  # GIPO: count of imagination branches
+    acc_img_steps = 0.0
     acc_cnt = 0
     best_reward = -1e9
 
@@ -1596,31 +1286,17 @@ def train_grpo(
             user_prompt = pdata["user_prompt"]
             gt_tools = pdata["gt_tools"]
 
-            # ==========================================================
-            # GIPO Phase 1: Generate 2 base rollouts + 0-2 branches
-            #
-            #   base_0 (skill-biased)   → branch_0 (flipped granularity)?
-            #   base_1 (oracle-seeded)  → branch_1 (flipped granularity)?
-            #
-            # Each (base, branch) pair shares the same prefix and only
-            # differs at one granularity decision → controlled comparison.
-            # If no counterfactual exists for a base, skip — no fallback.
-            # Group size is 2-4; advantage is computed over whatever exists.
-            # ==========================================================
             model.eval()
             rollouts = []
 
             system_prompt = build_system_prompt(pdata["task_name"])
 
-            # Build skill-biased variant for base_0 diversity
-            # Append directive instead of fragile string replace
             skill_biased_prompt = system_prompt + (
                 "\n\nIMPORTANT: You SHOULD prefer [SKILL] tools over atomic tools when possible. "
                 "Skills chain multiple steps and are more efficient. "
                 "Check the [SKILL] entries in the tool list first."
             )
 
-            # Build skill chains for counterfactual lookup
             _skill_chains = {}
             for sname, sdef in env.skills.items():
                 chain = sdef.get("tool_chain", [])
@@ -1628,7 +1304,6 @@ def train_grpo(
                     chain = [s.get("tool_name", "") for s in sdef.get("execution_plan", [])]
                 _skill_chains[sname] = [normalize_tool_name(t) for t in chain]
 
-            # Helper: compute reward for a rollout
             def _compute_reward(ro):
                 ut = [name for name, _ in ro["actions"]]
                 sn = list(ro["skill_names_used"])
@@ -1644,7 +1319,6 @@ def train_grpo(
                 ro["reward_breakdown"] = bd
                 return rw, bd
 
-            # --- Base rollout 0: skill-biased prompt for diversity ---
             t0 = max(0.1, base_temp * 0.8)
             base_0 = run_rollout(
                 model, tokenizer, env,
@@ -1656,7 +1330,6 @@ def train_grpo(
             base_0["rollout_type"] = "base"
             _compute_reward(base_0)
 
-            # --- Base rollout 1: oracle-seeded or higher temperature ---
             t1 = max(0.1, base_temp * 1.2)
             oracle_first = None
             if gt_tools:
@@ -1679,7 +1352,6 @@ def train_grpo(
 
             rollouts = [base_0, base_1]
 
-            # --- 0-step resample: if both bases are 0-step, retry ---
             has_any_action = any(r["num_steps"] > 0 for r in rollouts)
             resample_attempts = 0
             while not has_any_action and resample_attempts < 3:
@@ -1704,18 +1376,11 @@ def train_grpo(
                         logger.info(f"    [resample] attempt {resample_attempts}: "
                                     f"steps={retry_ro['num_steps']} R={retry_ro['reward']:.3f}")
 
-            # --- GIPO: generate counterfactual branches for each base ---
-            # For each base rollout, find the first step with an alternative
-            # granularity. Fork from that point and run to completion.
-            # If no counterfactual exists, skip — don't pad with fallbacks
-            # that would dilute the imagination signal.
             n_branches = 0
-            for ri, base_ro in enumerate(list(rollouts)):  # iterate over copy
+            for ri, base_ro in enumerate(list(rollouts)):
                 if base_ro["num_steps"] == 0:
-                    # Can't branch a 0-step rollout → skip
                     continue
 
-                # Find first eligible branching point
                 branch_step = None
                 cf_action = None
                 actions = base_ro["actions"]
@@ -1739,12 +1404,10 @@ def train_grpo(
                         break
 
                 if branch_step is not None and branch_step < len(offsets):
-                    # Fork from branch_step with counterfactual action
                     msg_offset = offsets[branch_step]
                     prefix_messages = base_ro["messages"][:msg_offset]
                     prefix_actions = actions[:branch_step]
 
-                    # Compute prefix atomic cost and collect prefix skill info
                     _prefix_atomic = 0
                     _prefix_skill_traces = []
                     _prefix_skill_names = []
@@ -1761,7 +1424,6 @@ def train_grpo(
                                         _sk_def = _sd
                                         break
                             if _sk_def:
-                                # Use actual trace length from base rollout (may be shorter if interrupted)
                                 _base_skill_names = base_ro.get("skill_names_used", [])
                                 _base_skill_traces = base_ro.get("skill_traces", [])
                                 _found_trace = False
@@ -1773,7 +1435,6 @@ def train_grpo(
                                         _found_trace = True
                                         break
                                 if not _found_trace:
-                                    # Fallback to definition chain length
                                     _chain = _sk_def.get("tool_chain", [])
                                     if not _chain:
                                         _chain = [s.get("tool_name", "") for s in _sk_def.get("execution_plan", [])]
@@ -1809,19 +1470,11 @@ def train_grpo(
                     _compute_reward(branch)
                     rollouts.append(branch)
                     n_branches += 1
-                # else: no counterfactual found → skip, don't pad with fallback
 
-            # rollouts has 2-4 entries: [base_0, base_1, (branch_0)?, (branch_1)?]
-            # Only base-branch pairs carry imagination signal.
 
-            # ========== GIPO Phase 1.5: Imagination Reward ==========
-            # For each (base, branch) pair, compute a symmetric reward bonus
-            # that directly encodes the granularity comparison signal.
-            # Δ > 0 means branch (alternative granularity) was better → base penalized, branch rewarded.
-            # Δ < 0 means base (original choice) was better → base rewarded, branch penalized.
-            img_scale = grpo_config.gipo_step_reward_scale  # 0.15
-            img_step_cap = grpo_config.gipo_step_reward_cap  # 0.1  per-branch cap
-            img_total_cap = grpo_config.gipo_total_reward_cap  # 0.3  per-rollout cap
+            img_scale = grpo_config.gipo_step_reward_scale
+            img_step_cap = grpo_config.gipo_step_reward_cap
+            img_total_cap = grpo_config.gipo_total_reward_cap
 
             for ro in rollouts:
                 if ro.get("rollout_type") != "branch":
@@ -1832,47 +1485,34 @@ def train_grpo(
                     continue
                 base_ro = rollouts[parent_idx]
 
-                # Δ > 0 means branch (alternative granularity) was better
                 delta = ro["reward"] - base_ro["reward"]
                 r_img = delta * img_scale
-                # Per-branch clip, then total clip
                 r_img = max(-img_step_cap, min(img_step_cap, r_img))
                 r_img = max(-img_total_cap, min(img_total_cap, r_img))
 
-                # Symmetric: branch gets +r_img, base gets -r_img
                 ro["reward"] += r_img
                 ro["reward_breakdown"]["r_imagination"] = round(r_img, 4)
                 base_ro["reward"] -= r_img
                 base_ro["reward_breakdown"]["r_imagination"] = round(-r_img, 4)
 
-            # Re-clamp after imagination adjustment
             for ro in rollouts:
                 ro["reward"] = max(ro["reward"], 0.0)
 
-            # ========== Phase 2: group-relative advantage ==========
             rewards = [r["reward"] for r in rollouts]
 
             mu = sum(rewards) / len(rewards)
             raw_std = math.sqrt(sum((r - mu)**2 for r in rewards) / len(rewards))
 
-            # Robust advantage: if reward variance is too low, the gradient
-            # is mostly noise. Use a minimum std threshold to avoid
-            # amplifying noise, and skip the update entirely when rewards
-            # are truly identical.
             MIN_ADV_STD = 0.05
             if raw_std < 1e-6:
-                # All rewards identical → zero advantage, skip gradient
                 for r in rollouts:
                     r["advantage"] = 0.0
             else:
                 std = max(raw_std, MIN_ADV_STD)
                 for i, r in enumerate(rollouts):
                     r["advantage"] = (rewards[i] - mu) / std
-                    # Clip advantage to prevent extreme updates
                     r["advantage"] = max(-3.0, min(3.0, r["advantage"]))
 
-            # ========== Logging ==========
-            # Detailed: first 5 prompts per epoch + every 50th prompt
             show_detail = pidx < 5 or pidx % 50 == 0
             if show_detail:
                 logger.info(f"  [prompt {pidx}] gt_tools={gt_tools[:4]}... "
@@ -1894,10 +1534,8 @@ def train_grpo(
                         f"eff={bd['r_efficiency']:.2f} img={bd.get('r_imagination',0):+.2f}) "
                         f"adv={r['advantage']:+.2f} tools={used[:5]}{branch_tag}"
                     )
-            # File: every prompt
             exec_logger.log_prompt(epoch, pidx, global_step, user_prompt, gt_tools, rollouts)
 
-            # ========== Phase 3: policy gradient ==========
             model.train()
             prompt_loss = 0.0
 
@@ -1918,10 +1556,6 @@ def train_grpo(
                 labels = labels.unsqueeze(0).to(device)
 
                 out = model(input_ids=input_ids, attention_mask=attn_mask, labels=labels)
-                # GIPO loss: advantage * cross_entropy
-                # Normalize by actual group size (2-4 rollouts)
-                #   adv > 0: minimize CE → reinforce this trajectory
-                #   adv < 0: maximize CE → suppress this trajectory
                 n_rollouts = len(rollouts)
                 pg_loss = adv * out.loss / (n_rollouts * grad_accum)
 
@@ -1929,19 +1563,16 @@ def train_grpo(
                     pg_loss.backward()
                     prompt_loss += pg_loss.item() * n_rollouts * grad_accum
 
-            # Stats
             n_rollouts = len(rollouts)
             acc_loss += prompt_loss
-            acc_reward += sum(rewards) / len(rewards)  # track group mean reward
+            acc_reward += sum(rewards) / len(rewards)
             skill_ratio = (sum(r["num_skill_calls"] for r in rollouts)
                            / max(sum(r["num_steps"] for r in rollouts), 1))
             acc_skill_r += skill_ratio
             acc_steps_ep += sum(r["num_steps"] for r in rollouts) / n_rollouts
-            # GIPO: track imagination stats
             acc_img_steps += n_branches
             acc_cnt += 1
 
-            # ========== Phase 4: optimizer step ==========
             if (pidx + 1) % grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
@@ -1969,14 +1600,12 @@ def train_grpo(
                     acc_img_steps = 0.0
                     acc_cnt = 0
 
-                # Periodic save (inside grad_accum block to avoid redundant saves)
                 if global_step > 0 and global_step % grpo_config.save_steps == 0:
                     sp = os.path.join(output_dir, f"checkpoint-{global_step}")
                     model.save_pretrained(sp)
                     tokenizer.save_pretrained(sp)
                     logger.info(f"Checkpoint → {sp}")
 
-        # Flush remaining accumulated gradients at epoch end
         if (pidx + 1) % grad_accum != 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -1987,24 +1616,15 @@ def train_grpo(
 
         logger.info(f"Epoch {epoch+1} done.  best_reward={best_reward:.3f}")
 
-    # Final save
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     exec_logger.save_summary()
     logger.info(f"GIPO complete → {output_dir}  best_reward={best_reward:.3f}")
 
 
-# ============================================================================
-# Backward-compatible wrapper
-# ============================================================================
-
 def generate_grpo_rollouts(*args, **kwargs):
     logger.info("Online GRPO: rollouts are generated on-the-fly, skipping offline generation.")
 
-
-# ============================================================================
-# Main
-# ============================================================================
 
 def main():
     import argparse

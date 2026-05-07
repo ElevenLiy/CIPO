@@ -1,30 +1,3 @@
-"""
-AdaMacro Step 4: Online GRPO Training
-=======================================
-
-Training process overview:
-==========================
-
-Each "step" in the log = 1 optimizer update, which processes (grad_accum × prompts).
-
-For EACH training prompt:
-  1. Generate G=4 rollouts with different temperatures
-     Each rollout = model interacts with environment step-by-step:
-       turn 0: model generates → parse tool_call → env.execute → get tool_response
-       turn 1: model sees history + tool_response → generates next tool_call → env.execute
-       ...
-       turn N: model generates text (no tool_call) → episode done
-  2. Compute reward for each rollout
-  3. Group-normalize → advantage  (positive = better than group mean)
-  4. Policy gradient: loss = advantage × cross_entropy(assistant_tokens_only)
-  5. Accumulate gradients for grad_accum prompts → optimizer.step()  ← this is 1 "step"
-
-Reward:
-  R = R_task + λ·R_skill + R_efficiency
-  R_task:  how many gt tools were covered (exact + fuzzy name matching)
-  R_skill: bonus for using skills successfully (THE key AdaMacro incentive)
-  R_eff:   bonus for fewer decision steps (skills compress steps)
-"""
 
 import json
 import copy
@@ -50,27 +23,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# Execution Logger: saves detailed per-step records to JSON
-# ============================================================================
-
 class ExecutionLogger:
-    """
-    Saves detailed training execution records to a JSON-lines file.
-    Each line = one prompt's complete rollout group.
-    """
     def __init__(self, log_path: str):
         self.log_path = log_path
         self.records = []
-        # Write header
         with open(log_path, "w") as f:
-            f.write("")  # clear
+            f.write("")
         logger.info(f"Execution log → {log_path}")
 
     def log_prompt(self, epoch: int, prompt_idx: int, global_step: int,
                    user_prompt: str, gt_tools: List[str],
                    rollouts: List[Dict]):
-        """Log one prompt's complete training record."""
         record = {
             "epoch": epoch,
             "prompt_idx": prompt_idx,
@@ -90,10 +53,8 @@ class ExecutionLogger:
                 "reward": round(r["reward"], 4),
                 "advantage": round(r["advantage"], 4),
                 "reward_breakdown": r.get("reward_breakdown", {}),
-                # Per-turn action log
                 "turns": [],
             }
-            # Extract turn-by-turn actions from messages
             for i, (tool_name, args) in enumerate(r["actions"]):
                 turn_info = {
                     "turn": i,
@@ -103,9 +64,7 @@ class ExecutionLogger:
                 }
                 rollout_record["turns"].append(turn_info)
 
-            # If model just output text without any tool call
             if r["num_steps"] == 0:
-                # Get the final text response
                 msgs = r.get("messages", [])
                 for m in reversed(msgs):
                     if m.get("role") == "assistant":
@@ -116,8 +75,6 @@ class ExecutionLogger:
 
         self.records.append(record)
 
-        # Append to file (JSON-lines format)
-        # Clean surrogates from model output before serialization
         def _clean_surrogates(obj):
             if isinstance(obj, str):
                 return obj.encode("utf-8", errors="replace").decode("utf-8")
@@ -131,7 +88,6 @@ class ExecutionLogger:
             f.write(json.dumps(_clean_surrogates(record), ensure_ascii=False) + "\n")
 
     def save_summary(self):
-        """Save a human-readable summary at the end."""
         summary_path = self.log_path.replace(".jsonl", "_summary.json")
         total = len(self.records)
         if total == 0:
@@ -165,7 +121,6 @@ class ExecutionLogger:
 
 
 def _truncate_args(args: Dict, max_len: int = 100) -> Dict:
-    """Truncate arg values for readable logging."""
     if not isinstance(args, dict):
         return {}
     out = {}
@@ -175,36 +130,15 @@ def _truncate_args(args: Dict, max_len: int = 100) -> Dict:
     return out
 
 
-# ============================================================================
-# Reward
-# ============================================================================
-
 class AdaMacroReward:
-    """
-    R(τ) = R_task + skill_bonus + R_efficiency
-
-    Core insight:
-      R_task (gt_tools coverage) is THE task-completion proxy.
-      skill_bonus is a small ADDITIVE reward when skills helped cover gt_tools.
-      If r_task=0, no amount of skill usage helps — this prevents collapse.
-
-    Gradient:
-      high_coverage + skill(~1.5) > high_coverage + atomic(1.0) > low_coverage + skill(0.3) > nothing(0)
-
-    The multiplier ensures:
-      - "right skill, right task" → r_task is high AND gets multiplied → best reward
-      - "wrong skill, any task"  → r_task stays low, multiplier on low base → low reward  
-      - "right atomic, no skill" → r_task is high, no multiplier → good but not best
-    """
     def __init__(self, config: GRPOConfig, skill_definitions: Dict = None):
-        self.lambda_skill = config.lambda_skill    # 0.3
+        self.lambda_skill = config.lambda_skill
         self.skill_chains = {}
         if skill_definitions:
             for sname, sdef in skill_definitions.items():
                 chain = sdef.get("tool_chain", [])
                 if not chain:
                     chain = [s.get("tool_name", "") for s in sdef.get("execution_plan", [])]
-                # Normalize chain tool names
                 self.skill_chains[sname] = [normalize_tool_name(t) for t in chain]
 
     def compute(
@@ -220,38 +154,24 @@ class AdaMacroReward:
         max_steps: int,
     ) -> Tuple[float, Dict]:
 
-        # ==============================================================
-        # R_task: tool overlap with ground truth (0 ~ 1.0)
-        #
-        # Matching levels:
-        #   1. Exact match → 1.0 credit
-        #   2. Substring match (after normalization) → 0.8 credit
-        #   3. Token Jaccard ≥ 0.5 → jaccard_score credit
-        # ==============================================================
-        # Normalize all tool names to strip version suffixes
         all_used = set(normalize_tool_name(t) for t in used_tools)
         for trace in skill_traces:
             for tool_name, _ in trace:
                 all_used.add(normalize_tool_name(tool_name))
         gt_set = set(normalize_tool_name(t) for t in gt_tools) if gt_tools else set()
-        # Preserve ordered lists for position-aware scoring
         gt_list = [normalize_tool_name(t) for t in gt_tools] if gt_tools else []
         used_list = [normalize_tool_name(t) for t in used_tools]
-        # Also append tools from skill traces in order
         for trace in skill_traces:
             for tool_name, _ in trace:
                 used_list.append(normalize_tool_name(tool_name))
 
         def _tokenize_tool(name: str) -> set:
-            """Split tool name into tokens for Jaccard comparison."""
             n = name.lower().replace("-", "_").replace(".", "_")
-            # Remove version suffixes like _v1, _v2
             import re as _re
             n = _re.sub(r'_v\d+$', '', n)
             return set(t for t in n.split("_") if len(t) >= 2)
 
         def _fuzzy_match_score(a: str, b: str) -> float:
-            """Return match score between two tool names (0~1)."""
             a_n = a.lower().replace("-", "_").replace(".", "_")
             b_n = b.lower().replace("-", "_").replace(".", "_")
             if a_n == b_n or a == b:
@@ -283,10 +203,7 @@ class AdaMacroReward:
 
             base_coverage = min(total_credit / max(len(gt_set), 1), 1.0)
 
-            # ---- Position-aware order bonus ----
-            # Build matched position pairs: for each gt tool (in order),
-            # find its best match position in used_list
-            gt_match_positions = []  # (gt_index, used_index, score)
+            gt_match_positions = []
             for gi, gt in enumerate(gt_list):
                 best_score = 0.0
                 best_ui = -1
@@ -300,12 +217,8 @@ class AdaMacroReward:
                 if best_score > 0:
                     gt_match_positions.append((gi, best_ui, best_score))
 
-            # Compute LCS length on the used_list positions to measure order preservation
             if len(gt_match_positions) >= 2:
-                # Extract the used_list positions of matched gt tools (in gt order)
                 pos_seq = [ui for _, ui, _ in gt_match_positions]
-                # LCS of pos_seq with its sorted version = longest increasing subsequence
-                # Use patience sorting for O(n log n) LIS
                 import bisect
                 tails = []
                 for p in pos_seq:
@@ -321,8 +234,6 @@ class AdaMacroReward:
             else:
                 order_bonus = 0.0
 
-            # Final r_task: coverage weighted by order quality
-            # 70% from coverage, 30% bonus for correct ordering
             r_task = base_coverage * (0.7 + 0.3 * order_bonus)
 
             if r_task == 0.0 and completed:
@@ -334,7 +245,6 @@ class AdaMacroReward:
         else:
             r_task = 0.0
 
-        # 0-step penalty
         if num_decision_steps == 0:
             return 0.0, {
                 "r_task": 0.0, "skill_bonus": 0.0, "r_efficiency": 0.0,
@@ -342,33 +252,22 @@ class AdaMacroReward:
                 "tools_used": [], "note": "0-step penalty",
             }
 
-        # ==============================================================
-        # Skill bonus: small ADDITIVE reward when skills genuinely helped
-        #
-        # Design: skill bonus is additive (not multiplicative) to avoid
-        # compounding bias that causes skill-only collapse.
-        # Max skill bonus ≈ +0.1, compared to r_task range [0, 1].
-        # Irrelevant skill calls receive a penalty.
-        # ==============================================================
         skill_bonus = 0.0
         n_skill_ok = 0
         n_skill_relevant = 0
         n_skill_irrelevant = 0
 
         if skill_traces and skill_names:
-            # Track unique skills already counted (no stacking from repeated calls)
             seen_skills = set()
 
             for i, trace in enumerate(skill_traces):
                 sname = skill_names[i] if i < len(skill_names) else ""
 
-                # Skip duplicate skill calls — same skill called again adds nothing
                 if sname in seen_skills:
                     continue
 
                 chain = self.skill_chains.get(sname, [])
 
-                # How many gt_tools does this skill's chain cover? (with fuzzy matching)
                 chain_coverage = 0.0
                 if gt_set and chain:
                     chain_credit = 0.0
@@ -395,7 +294,6 @@ class AdaMacroReward:
                 all_ok = all(s == "success" for _, s in trace)
 
                 if chain_coverage > 0 and all_ok:
-                    # Additive bonus: max 0.1 per relevant skill (capped below)
                     this_bonus = 0.05 + 0.05 * chain_coverage
                     skill_bonus += this_bonus
                     n_skill_ok += 1
@@ -409,48 +307,30 @@ class AdaMacroReward:
                     n_skill_relevant += 1
                     seen_skills.add(sname)
                 elif chain_coverage == 0 and chain:
-                    # PENALTY: skill chain has zero overlap with gt_tools
-                    # Calling an irrelevant skill wastes steps and should be discouraged
                     skill_bonus -= 0.05
                     n_skill_irrelevant += 1
                     seen_skills.add(sname)
 
-            # Cap total skill bonus to prevent stacking
             skill_bonus = max(-0.15, min(skill_bonus, 0.1))
 
-            # Penalize repeated skill calls (same skill called N>1 times)
-            # Count total skill calls vs unique skills
             if num_skill_calls > len(seen_skills) and len(seen_skills) > 0:
                 repeat_count = num_skill_calls - len(seen_skills)
-                skill_bonus -= 0.03 * repeat_count  # -0.03 per repeated call
+                skill_bonus -= 0.03 * repeat_count
                 skill_bonus = max(skill_bonus, -0.15)
 
-        # ==============================================================
-        # R_efficiency: fewer decision steps (gated by coverage quality)
-        # ==============================================================
         r_eff = 0.0
         if completed and num_decision_steps > 0:
-            # Gate: only grant efficiency bonus when task is reasonably solved
             if r_task >= 0.4:
                 r_eff += max(0, 1 - num_decision_steps / max_steps) * 0.15 * r_task
-                # Compression bonus: ONLY when skills were actually used
-                # Without this gate, early stopping gets free efficiency points
                 if gt_tools and num_decision_steps < len(gt_tools) and num_skill_calls > 0:
                     r_eff += (len(gt_tools) - num_decision_steps) * 0.05
 
-        # Under-exploration penalty: punish very short rollouts with low coverage
         if num_decision_steps < 3 and r_task < 0.3:
             r_eff -= 0.05 * (3 - num_decision_steps)
 
-        # ==============================================================
-        # Total: r_task + skill_bonus + efficiency
-        # Additive design prevents skill bias from dominating r_task.
-        # ==============================================================
         total = r_task + skill_bonus + r_eff
-        # Clamp to non-negative: negative rewards destabilize GRPO advantage
         total = max(total, 0.0)
 
-        # Safely get order_bonus (may not be defined if gt_set is empty)
         _order_bonus = order_bonus if (gt_set and all_used) else 0.0
 
         breakdown = {
@@ -467,20 +347,7 @@ class AdaMacroReward:
         return total, breakdown
 
 
-# ============================================================================
-# Tool Environment
-# ============================================================================
-
 class ToolEnvironment:
-    """
-    Wraps tool_simulator_database + SkillInterpreter.
-    
-    Parameter matching: 4-level fallback
-      1. Exact match in DB
-      2. Key-overlap match
-      3. Most-frequent call from rl_dataset
-      4. Generic response
-    """
     def __init__(self, augmented_tools_path: str, tool_sim_db_path: str,
                  rl_dataset_path: str = None):
         with open(augmented_tools_path, "r") as f:
@@ -506,7 +373,6 @@ class ToolEnvironment:
             from step2_skill_instantiation import SkillInterpreter
         self.interpreter = SkillInterpreter(self.tool_sim_db)
 
-        # Build indexes
         self.tool_freq_index = {}
         self.tool_calls_index = {}
         if rl_dataset_path and os.path.exists(rl_dataset_path):
@@ -583,19 +449,15 @@ class ToolEnvironment:
         if not isinstance(arguments, dict):
             arguments = {}
 
-        # Try exact match first, then normalized name fallback
-        # Model may generate "excel-format_range" but DB has "excel-format_range_v13"
         resolved_name = tool_name
         if (tool_name not in self.skills and tool_name not in self.atomic_tools
                 and tool_name not in self.tool_calls_index):
             norm = normalize_tool_name(tool_name)
-            # Search for a DB entry whose normalized name matches
             for orig in list(self.all_tool_names) + list(self.tool_calls_index.keys()):
                 if normalize_tool_name(orig) == norm:
                     resolved_name = orig
                     break
 
-        # Check if resolved tool_name is known AT ALL
         is_known = (resolved_name in self.skills or resolved_name in self.atomic_tools
                     or resolved_name in self.all_tool_names
                     or resolved_name in self.tool_calls_index
@@ -625,7 +487,6 @@ class ToolEnvironment:
                 "atomic_cost": 1,
             }
         else:
-            # UNKNOWN tool: return error, mark as failure
             return {
                 "output": json.dumps({"error": f"Unknown tool: {tool_name}"}),
                 "is_skill": False,
@@ -636,32 +497,12 @@ class ToolEnvironment:
             }
 
 
-# ============================================================================
-# Action parsing
-# ============================================================================
-
 def normalize_tool_name(name: str) -> str:
-    """Strip version suffixes like _v1, _v13, _v2beta from tool names.
-    
-    The version suffix is only relevant for DB parameter lookup, not for
-    the model's tool selection. Keeping it increases vocabulary and makes
-    generalization harder.
-    
-    Examples:
-        excel-format_range_v13 → excel-format_range
-        google_maps_geocode_v1 → google_maps_geocode
-        canvas-canvas_create_quiz → canvas-canvas_create_quiz (no change)
-    """
     import re as _re
     return _re.sub(r'_v\d+\w*$', '', name)
 
 
 def find_best_matching_skill(gt_tools: List[str], skills: Dict[str, Dict]) -> Optional[str]:
-    """Find the skill whose tool_chain has maximum overlap with gt_tools.
-
-    Returns the skill name with the highest coverage (at least 1 overlapping
-    tool), or None if no skill matches any gt_tool.
-    """
     if not gt_tools or not skills:
         return None
 
@@ -716,10 +557,6 @@ def parse_tool_call(response: str) -> Optional[Dict]:
     return None
 
 
-# ============================================================================
-# Single Rollout
-# ============================================================================
-
 def run_rollout(
     model, tokenizer, env: ToolEnvironment,
     system_prompt: str, user_prompt: str,
@@ -728,25 +565,12 @@ def run_rollout(
     oracle_first_tool: str = None,
     gt_tools_len: int = 0,
 ) -> Dict:
-    """
-    Run a single rollout episode.
-    
-    Strategy: "free first, force if stuck"
-    - Every turn: let model generate freely (it may output tool_call or text)
-    - If model outputs tool_call → execute it, continue
-    - If model outputs text AND has ≥1 prior action → treat as task done (natural stop)
-    - If model outputs text AND has 0 actions → use forced prefix to guarantee ≥1 tool call
-    
-    This gives the model freedom to decide when to stop, while ensuring
-    every trajectory has at least 1 action for GRPO to learn from.
-    """
     import torch
     if not hasattr(run_rollout, '_debug_count'):
         run_rollout._debug_count = 0
 
     TOOL_CALL_PREFIX = '<tool_call>\n{"name": "'
 
-    # Extract available tool names from system prompt for ultimate fallback
     _available_tools = []
     for line in system_prompt.split("\n"):
         line = line.strip()
@@ -756,7 +580,7 @@ def run_rollout(
                 tname = tname[7:]
             if tname and len(tname) < 60:
                 _available_tools.append(tname)
-    _available_tools_set = set(_available_tools)  # for O(1) lookup in salvage
+    _available_tools_set = set(_available_tools)
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -765,7 +589,7 @@ def run_rollout(
     actions = []
     skill_traces = []
     skill_names_used = []
-    continued_this_rollout = False  # at most 1 continuation nudge per rollout
+    continued_this_rollout = False
     total_atomic = 0
     completed = False
 
@@ -784,26 +608,15 @@ def run_rollout(
         if len(prompt) > 50000:
             prompt = prompt[:50000]
 
-        # ==============================================================
-        # Turn routing:
-        #   actions < 2: forced prefix → must output tool
-        #   actions ≥ 2: free generation → can choose to stop
-        #
-        # This ensures every rollout tries at least 2 tools before
-        # deciding to stop, preventing the "1-tool-then-text" collapse.
-        # ==============================================================
         min_forced_steps = min(max(3, gt_tools_len // 2), 6) if gt_tools_len > 0 else 3
 
         if len(actions) < min_forced_steps:
-            # --- FORCED TURN: must output a tool ---
 
-            # Oracle mode on first turn only
             if oracle_first_tool is not None and len(actions) == 0:
                 tool_call = {"name": oracle_first_tool, "arguments": {}}
                 if run_rollout._debug_count < 20:
                     logger.info(f"    [oracle_seed] forced first tool: {oracle_first_tool}")
             else:
-                # Forced prefix generation
                 forced_prompt = prompt + TOOL_CALL_PREFIX
                 try:
                     inputs = tokenizer(forced_prompt, return_tensors="pt", truncation=True, max_length=3584)
@@ -824,7 +637,6 @@ def run_rollout(
                 gen_ids = outputs[0][inputs["input_ids"].shape[-1]:]
                 completion = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
 
-                # Fallback if empty
                 if not completion and _available_tools:
                     import random as _rnd
                     completion = f'{_rnd.choice(_available_tools)}", "arguments": {{}}}}\n</tool_call>'
@@ -836,7 +648,6 @@ def run_rollout(
                 full_response = TOOL_CALL_PREFIX + completion
                 tool_call = parse_tool_call(full_response)
 
-                # Salvage
                 if tool_call is None:
                     name_match = re.match(r'^([a-zA-Z][\w\-\.]*)', completion)
                     if name_match and _available_tools_set:
@@ -851,7 +662,6 @@ def run_rollout(
                         break
 
         else:
-            # --- SUBSEQUENT TURNS: free generation ---
             try:
                 inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=3584)
             except (TypeError, ValueError):
@@ -874,34 +684,27 @@ def run_rollout(
             tool_call = parse_tool_call(response)
 
             if tool_call is None:
-                # Model wants to stop — but check if it stopped too early
                 suggested_min = min_forced_steps + 1
                 if (len(actions) < suggested_min
                         and turn < max_turns - 1
                         and not continued_this_rollout):
-                    # Continuation nudge: tell the model to keep going
                     continued_this_rollout = True
                     messages.append({"role": "assistant", "content": response})
                     messages.append({
                         "role": "user",
                         "content": "You have not completed the task yet. Continue calling tools to finish."
                     })
-                    continue  # next iteration; forced/free branch will handle it
+                    continue
                 else:
-                    # Natural completion
                     messages.append({"role": "assistant", "content": response})
                     completed = True
                     break
 
-        # ==============================================================
-        # Step 3: Execute the tool call
-        # ==============================================================
         tool_name = tool_call["name"]
         arguments = tool_call["arguments"]
         if not isinstance(arguments, dict):
             arguments = {}
 
-        # Filter nonsense tool names
         if len(tool_name) > 60 or " " in tool_name or tool_name.startswith("http"):
             if len(actions) == 0:
                 completed = False
@@ -938,10 +741,6 @@ def run_rollout(
         "temperature": temperature,
     }
 
-
-# ============================================================================
-# Tokenize with assistant-only label mask
-# ============================================================================
 
 def tokenize_with_assistant_mask(messages, tokenizer, max_length=4096):
     import torch
@@ -998,10 +797,6 @@ def tokenize_with_assistant_mask(messages, tokenizer, max_length=4096):
     return input_ids, attention_mask, labels
 
 
-# ============================================================================
-# Online GRPO Training
-# ============================================================================
-
 def train_grpo(
     model_name: str,
     sft_checkpoint_dir: str,
@@ -1013,7 +808,6 @@ def train_grpo(
     from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
     from peft import PeftModel, LoraConfig, get_peft_model, TaskType
 
-    # ---------------------------------------------------------------- model
     model_path = get_model_path(model_name)
     logger.info(f"Loading base model: {model_path}")
 
@@ -1043,17 +837,14 @@ def train_grpo(
     model.print_trainable_parameters()
     device = next(model.parameters()).device
 
-    # ---------------------------------------------------------------- env
     env = ToolEnvironment(AUGMENTED_TOOLS_PATH, TOOL_SIMULATOR_DB_PATH, RL_DATASET_PATH)
     reward_fn = AdaMacroReward(grpo_config, skill_definitions=env.skills)
 
-    # Build tool description matching SFT format (with parameters)
     with open(AUGMENTED_TOOLS_PATH, "r") as f:
         all_augmented_tools = json.load(f)
 
-    tool_desc_map = {}  # tool_name → description string
-    # Also build a mapping from normalized name → original name for DB lookup
-    norm_to_orig = {}  # normalized_name → original_name (for execute)
+    tool_desc_map = {}
+    norm_to_orig = {}
     for t in all_augmented_tools:
         orig_name = t["name"]
         norm_name = normalize_tool_name(orig_name)
@@ -1066,7 +857,6 @@ def train_grpo(
                 param_names = list(props.keys())[:5]
                 param_str = f" params: {param_names}"
 
-        # For skills: show the tool chain so model knows what's inside
         chain_str = ""
         if t.get("is_skill"):
             chain = t.get("tool_chain", [])
@@ -1076,32 +866,20 @@ def train_grpo(
                 norm_chain = [normalize_tool_name(c) for c in chain[:5]]
                 chain_str = f" [chain: {' → '.join(norm_chain)}]"
 
-        # Use normalized name in prompt (model sees clean names)
         tool_desc_map[norm_name] = f"- {tag}{norm_name}: {t.get('description','')[:100]}{chain_str}{param_str}"
-        # Keep mapping to original for DB lookup
         if norm_name not in norm_to_orig:
             norm_to_orig[norm_name] = orig_name
 
     def build_system_prompt(task_name: str) -> str:
-        """
-        Build per-prompt system prompt.
-        
-        NO gt_tools leak: we use task_name to pick a relevant tool CATEGORY
-        (e.g., "filesystem", "web") rather than the exact gt tools.
-        This avoids train/eval distribution mismatch.
-        """
         lines = []
         seen = set()
 
-        # Infer tool category from task_name (e.g., "filesystem_read_task" → "filesystem")
         task_lower = task_name.lower().replace("-", "_")
         category_keywords = set()
         for part in task_lower.split("_"):
             if len(part) >= 3:
                 category_keywords.add(part)
 
-        # Add skills first (always visible, core to AdaMacro)
-        # env.skills keys are original names, tool_desc_map keys are normalized
         norm_skill_names = set(normalize_tool_name(s) for s in env.skills)
         for tn, desc in tool_desc_map.items():
             if tn in norm_skill_names:
@@ -1110,7 +888,6 @@ def train_grpo(
             if len(seen) >= 15:
                 break
 
-        # Add tools whose name matches task category keywords
         for tn, desc in tool_desc_map.items():
             if tn in seen:
                 continue
@@ -1121,7 +898,6 @@ def train_grpo(
             if len(seen) >= 40:
                 break
 
-        # Fill remaining with random other tools
         other_tools = [tn for tn in tool_desc_map if tn not in seen]
         random.shuffle(other_tools)
         for tn in other_tools:
@@ -1148,7 +924,6 @@ def train_grpo(
             "After receiving all tool responses, provide a brief text summary to finish."
         )
 
-    # ---------------------------------------------------------------- prompts
     with open(RL_DATASET_PATH, "r") as f:
         rl_data = json.load(f)
     episodes = rl_data.get("episodes", [])
@@ -1156,7 +931,6 @@ def train_grpo(
     train_prompts = []
     for ep in episodes:
         if ep.get("success", 0) == 1 and ep.get("user_prompt") and ep.get("tool_names"):
-            # Normalize tool names (strip _v13 etc.) and deduplicate
             raw_gt = ep.get("tool_names", [])
             norm_gt = list(dict.fromkeys(normalize_tool_name(t) for t in raw_gt))
             train_prompts.append({
@@ -1166,7 +940,6 @@ def train_grpo(
             })
     logger.info(f"Training prompts: {len(train_prompts)}")
 
-    # ---------------------------------------------------------------- hyper-params
     G = grpo_config.group_size
     num_epochs = grpo_config.num_epochs
     lr = grpo_config.learning_rate
@@ -1183,14 +956,12 @@ def train_grpo(
         [p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=0.01)
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, max(total_steps, 1))
 
-    # ---------------------------------------------------------------- execution logger
     log_path = os.path.join(output_dir, "execution_log.jsonl")
     exec_logger = ExecutionLogger(log_path)
 
     logger.info(f"Online GRPO  G={G}  epochs={num_epochs}  lr={lr}  "
                 f"grad_accum={grad_accum}  total_steps≈{total_steps}")
 
-    # ---------------------------------------------------------------- training loop
     global_step = 0
     acc_loss = acc_reward = acc_steps_ep = acc_skill_r = 0.0
     acc_cnt = 0
@@ -1204,15 +975,11 @@ def train_grpo(
             user_prompt = pdata["user_prompt"]
             gt_tools = pdata["gt_tools"]
 
-            # ========== Phase 1: generate G rollouts ==========
             model.eval()
             rollouts = []
 
-            # Per-prompt system prompt (uses task category, NOT gt_tools to avoid leak)
             system_prompt = build_system_prompt(pdata["task_name"])
 
-            # Build a skill-biased variant for g=0:
-            # Append directive instead of fragile string replace
             skill_biased_prompt = system_prompt + (
                 "\n\nIMPORTANT: You SHOULD prefer [SKILL] tools over atomic tools when possible. "
                 "Skills chain multiple steps and are more efficient. "
@@ -1223,30 +990,15 @@ def train_grpo(
                 t = base_temp * (0.6 + g * 0.3)
                 t = max(0.1, min(t, 1.5))
 
-                # Anti-collapse strategy with 4 diverse rollout modes:
-                #   g=0: skill-biased prompt (encourage skill usage)
-                #   g=1: normal prompt
-                #   g=2: high temperature (t × 1.5) for exploration
-                #   g=3: oracle-seeded — pick a random gt_tool as forced first action
-                #
-                # g=3 is the KEY anti-collapse mechanism:
-                # Instead of letting the model choose (it'll pick the collapsed tool),
-                # we FORCE a random gt_tool as the first tool call. The model then
-                # continues from there. This rollout almost always gets a different
-                # (and often better) reward, breaking the advantage=0 deadlock.
                 
                 oracle_first_tool = None
-                up = user_prompt  # per-group user prompt (may be augmented)
+                up = user_prompt
                 if g == 0:
-                    # g=0: low temperature exploitation with normal prompt
                     sp = system_prompt
                 elif g == 2:
-                    t = min(base_temp * 1.8, 2.0)  # much higher temp
+                    t = min(base_temp * 1.8, 2.0)
                     sp = system_prompt
                 elif g == G - 1:
-                    # Oracle-seeded: use normal prompt (not skill-biased).
-                    # 50/50 chance of seeding with skill vs atomic gt_tool
-                    # to ensure model learns BOTH pathways.
                     sp = system_prompt
                     if gt_tools:
                         best_skill = find_best_matching_skill(gt_tools, env.skills)
@@ -1282,17 +1034,12 @@ def train_grpo(
                 rollout["reward_breakdown"] = breakdown
                 rollouts.append(rollout)
 
-            # --- 0-step resample: if ALL rollouts are 0-step, resample ---
-            # GRPO needs at least 1 trajectory with actions for gradient signal.
-            # Retry up to 3 times with increasing temperature.
             has_any_action = any(r["num_steps"] > 0 for r in rollouts)
             resample_attempts = 0
             while not has_any_action and resample_attempts < 3:
                 resample_attempts += 1
-                # Higher temperature → more exploration
                 t = base_temp * (1.5 + resample_attempts * 0.5)
                 t = min(t, 2.0)
-                # Try skill-biased prompt (more likely to produce tool calls)
                 rollout = run_rollout(
                     model, tokenizer, env,
                     skill_biased_prompt, user_prompt,
@@ -1315,7 +1062,6 @@ def train_grpo(
                 rollout["reward_breakdown"] = breakdown
 
                 if rollout["num_steps"] > 0:
-                    # Replace the worst (first 0-step) rollout
                     for ri in range(len(rollouts)):
                         if rollouts[ri]["num_steps"] == 0:
                             rollouts[ri] = rollout
@@ -1326,11 +1072,9 @@ def train_grpo(
                                     f"got {rollout['num_steps']} steps, "
                                     f"reward={reward:.3f}, t={t:.1f}")
 
-            # --- Skill resample: if no rollout used a skill, try up to 2 more ---
             has_skill = any(r["num_skill_calls"] > 0 for r in rollouts)
             has_any_action = any(r["num_steps"] > 0 for r in rollouts)
             if not has_skill and has_any_action and env.skills:
-                # Find which skills COULD apply (their constituent tools overlap with gt)
                 gt_set = set(gt_tools)
                 candidate_skills = []
                 for sname, sdef in env.skills.items():
@@ -1338,7 +1082,6 @@ def train_grpo(
                     if any(t in gt_set for t in chain):
                         candidate_skills.append(sname)
 
-                # Build skill-hint prompt: explicitly mention candidate skills
                 if candidate_skills:
                     skill_hint = (
                         f"\n\nHint: consider using one of these skills which may help: "
@@ -1377,30 +1120,21 @@ def train_grpo(
                         rollouts[worst_idx] = rollout
                         break
 
-            # ========== Phase 2: group-relative advantage ==========
             rewards = [r["reward"] for r in rollouts]
 
             mu = sum(rewards) / len(rewards)
             raw_std = math.sqrt(sum((r - mu)**2 for r in rewards) / len(rewards))
 
-            # Robust advantage: if reward variance is too low, the gradient
-            # is mostly noise. Use a minimum std threshold to avoid
-            # amplifying noise, and skip the update entirely when rewards
-            # are truly identical.
             MIN_ADV_STD = 0.05
             if raw_std < 1e-6:
-                # All rewards identical → zero advantage, skip gradient
                 for r in rollouts:
                     r["advantage"] = 0.0
             else:
                 std = max(raw_std, MIN_ADV_STD)
                 for i, r in enumerate(rollouts):
                     r["advantage"] = (rewards[i] - mu) / std
-                    # Clip advantage to prevent extreme updates
                     r["advantage"] = max(-3.0, min(3.0, r["advantage"]))
 
-            # ========== Logging ==========
-            # Detailed: first 5 prompts per epoch + every 50th prompt
             show_detail = pidx < 5 or pidx % 50 == 0
             if show_detail:
                 logger.info(f"  [prompt {pidx}] gt_tools={gt_tools[:4]}...")
@@ -1416,10 +1150,8 @@ def train_grpo(
                         f"eff={bd['r_efficiency']:.2f}) "
                         f"adv={r['advantage']:+.2f} tools={used[:5]}"
                     )
-            # File: every prompt
             exec_logger.log_prompt(epoch, pidx, global_step, user_prompt, gt_tools, rollouts)
 
-            # ========== Phase 3: policy gradient ==========
             model.train()
             prompt_loss = 0.0
 
@@ -1440,25 +1172,20 @@ def train_grpo(
                 labels = labels.unsqueeze(0).to(device)
 
                 out = model(input_ids=input_ids, attention_mask=attn_mask, labels=labels)
-                # GRPO loss: advantage * cross_entropy
-                #   adv > 0: minimize CE → reinforce this trajectory
-                #   adv < 0: maximize CE → suppress this trajectory
                 pg_loss = adv * out.loss / (G * grad_accum)
 
                 if torch.isfinite(pg_loss):
                     pg_loss.backward()
                     prompt_loss += pg_loss.item() * G * grad_accum
 
-            # Stats
             acc_loss += prompt_loss
-            acc_reward += sum(rewards) / len(rewards)  # track group mean reward
+            acc_reward += sum(rewards) / len(rewards)
             skill_ratio = (sum(r["num_skill_calls"] for r in rollouts)
                            / max(sum(r["num_steps"] for r in rollouts), 1))
             acc_skill_r += skill_ratio
             acc_steps_ep += sum(r["num_steps"] for r in rollouts) / G
             acc_cnt += 1
 
-            # ========== Phase 4: optimizer step ==========
             if (pidx + 1) % grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
@@ -1483,14 +1210,12 @@ def train_grpo(
                     acc_loss = acc_reward = acc_skill_r = acc_steps_ep = 0.0
                     acc_cnt = 0
 
-                # Periodic save (inside grad_accum block to avoid redundant saves)
                 if global_step > 0 and global_step % grpo_config.save_steps == 0:
                     sp = os.path.join(output_dir, f"checkpoint-{global_step}")
                     model.save_pretrained(sp)
                     tokenizer.save_pretrained(sp)
                     logger.info(f"Checkpoint → {sp}")
 
-        # Flush remaining accumulated gradients at epoch end
         if (pidx + 1) % grad_accum != 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -1501,24 +1226,15 @@ def train_grpo(
 
         logger.info(f"Epoch {epoch+1} done.  best_reward={best_reward:.3f}")
 
-    # Final save
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     exec_logger.save_summary()
     logger.info(f"GRPO complete → {output_dir}  best_reward={best_reward:.3f}")
 
 
-# ============================================================================
-# Backward-compatible wrapper
-# ============================================================================
-
 def generate_grpo_rollouts(*args, **kwargs):
     logger.info("Online GRPO: rollouts are generated on-the-fly, skipping offline generation.")
 
-
-# ============================================================================
-# Main
-# ============================================================================
 
 def main():
     import argparse

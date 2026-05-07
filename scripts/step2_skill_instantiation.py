@@ -1,17 +1,3 @@
-"""
-AdaMacro Step 2: Automatic Skill Instantiation & Trace-Aware Execution
-=======================================================================
-
-Implements Section 2.2 of the paper:
-- Convert BPE macro tokens into executable skills (templates)
-- Auto-determine exposed parameters vs internally-piped parameters
-- Expose select_strategy as a discrete parameter for LLM control
-- Inject trace recording and soft-interrupt mechanism
-- Register skills into augmented tool library alongside atomic tools
-
-Input:  skill_library.json (from Step 1), all_tools_v2.json
-Output: augmented_tools.json (atomic + skill tools)
-"""
 
 import json
 import copy
@@ -30,12 +16,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# Skill Template Definitions
-# ============================================================================
-
 class SkillTemplate:
-    """Base class for skill execution templates."""
     
     SEQUENTIAL = "sequential"
     SELECT = "select"
@@ -43,14 +24,6 @@ class SkillTemplate:
     
     @staticmethod
     def detect_template(tool_details: List[Dict]) -> str:
-        """
-        Auto-detect the appropriate template based on tool chain analysis.
-        
-        Rules:
-        - If any tool returns list/array outputs and next tool needs an ID/index
-          -> SELECT template
-        - Otherwise -> SEQUENTIAL template
-        """
         list_output_keywords = [
             "search", "list", "query", "find", "get_all", "fetch",
             "list_directory", "search_files"
@@ -63,9 +36,7 @@ class SkillTemplate:
             curr_name = tool_details[i].get("name", "").lower()
             next_params = [p.lower() for p in tool_details[i + 1].get("params", [])]
             
-            # Check if current tool likely returns a list
             is_list_output = any(kw in curr_name for kw in list_output_keywords)
-            # Check if next tool needs selection
             needs_select = any(kw in p for p in next_params for kw in select_input_keywords)
             
             if is_list_output and needs_select:
@@ -74,34 +45,14 @@ class SkillTemplate:
         return SkillTemplate.SEQUENTIAL
 
 
-# ============================================================================
-# Parameter Analysis
-# ============================================================================
-
 def analyze_skill_parameters(
     tool_details: List[Dict],
     tool_schemas: Dict[str, Dict],
 ) -> Tuple[List[Dict], List[Dict], Dict[int, Dict[str, str]]]:
-    """
-    Analyze parameter flow within a macro to determine:
-    1. exposed_params: Parameters the LLM must provide (skill's formal parameters)
-    2. internal_params: Parameters auto-piped from previous step outputs
-    3. pipe_map: Mapping of which output fields feed into which input params
-    
-    Strategy:
-    - The first tool's required params are always exposed
-    - For subsequent tools, if a param name matches an output field of any
-      previous tool, it's internal (auto-piped)
-    - Remaining params are exposed
-    
-    Returns:
-        exposed_params, internal_params, pipe_map
-    """
     exposed_params = []
     internal_params = []
-    pipe_map = {}  # {step_idx: {param_name: source_description}}
+    pipe_map = {}
     
-    # Track what output fields are available from previous steps
     available_outputs: Set[str] = set()
     
     for step_idx, tool in enumerate(tool_details):
@@ -125,11 +76,8 @@ def analyze_skill_parameters(
             }
             
             if step_idx == 0:
-                # First tool: all params are exposed
                 exposed_params.append(param_info)
             else:
-                # Check if this param can be piped from previous outputs
-                # Heuristic: common naming patterns
                 pipeable = False
                 for common_pipe in _get_pipe_candidates(param):
                     if common_pipe in available_outputs:
@@ -145,19 +93,14 @@ def analyze_skill_parameters(
         if step_pipes:
             pipe_map[step_idx] = step_pipes
         
-        # Add this tool's output fields to available outputs
-        # Use actual_keys as proxy for potential output fields
         available_outputs.update(actual_keys)
-        # Also add common output field names
         available_outputs.update(["result", "output", "data", "content", "text", "id", "path"])
     
     return exposed_params, internal_params, pipe_map
 
 
 def _get_pipe_candidates(param_name: str) -> List[str]:
-    """Generate candidate field names that might pipe into this param."""
     candidates = [param_name]
-    # Common mappings
     pipe_mappings = {
         "path": ["path", "file_path", "filepath", "output_path"],
         "content": ["content", "text", "data", "output", "result"],
@@ -171,41 +114,23 @@ def _get_pipe_candidates(param_name: str) -> List[str]:
     return list(set(candidates))
 
 
-# ============================================================================
-# Skill Instantiation
-# ============================================================================
-
 def instantiate_skill(
     macro: Dict,
     tool_schemas: Dict[str, Dict],
     skill_config: SkillConfig,
 ) -> Dict:
-    """
-    Convert a BPE macro into an executable skill definition.
-    
-    The skill:
-    - Has a name like "skill_macro_001"
-    - Has a natural language description
-    - Has formal parameters (exposed + select_strategy)
-    - Has internal execution template
-    - Supports trace recording and soft interrupt
-    """
     macro_id = macro["macro_id"]
     tool_names = macro["tool_names"]
     tool_details = macro.get("tool_details", [])
     
-    # Detect template type
     template_type = SkillTemplate.detect_template(tool_details)
     
-    # Analyze parameters
     exposed_params, internal_params, pipe_map = analyze_skill_parameters(
         tool_details, tool_schemas
     )
     
-    # Build skill name and description
     skill_name = f"skill_{macro_id}"
     
-    # Generate description from tool chain
     tool_desc_parts = []
     for td in tool_details:
         desc = td.get("description", "")
@@ -224,7 +149,6 @@ def instantiate_skill(
     if len(tool_desc_parts) > 3:
         skill_description += f" ... and {len(tool_desc_parts) - 3} more steps."
     
-    # Build parameter schema for the skill
     skill_params = {}
     for p in exposed_params:
         skill_params[p["name"]] = {
@@ -235,7 +159,6 @@ def instantiate_skill(
             "source_step": p["step_index"],
         }
     
-    # Add select_strategy parameter for SELECT templates
     if template_type == SkillTemplate.SELECT:
         skill_params["select_strategy"] = {
             "type": "string",
@@ -249,7 +172,6 @@ def instantiate_skill(
             "default": "rank-0",
         }
     
-    # Build execution plan
     execution_plan = []
     for step_idx, tname in enumerate(tool_names):
         step = {
@@ -258,7 +180,6 @@ def instantiate_skill(
             "params_source": {},
         }
         
-        # Determine parameter sources
         td = tool_details[step_idx] if step_idx < len(tool_details) else {}
         for param in td.get("params", []):
             if step_idx in pipe_map and param in pipe_map[step_idx]:
@@ -301,28 +222,9 @@ def instantiate_skill(
     return skill
 
 
-# ============================================================================
-# Trace-Aware Skill Interpreter
-# ============================================================================
-
 class SkillInterpreter:
-    """
-    Runtime interpreter for executing skills with trace recording.
-    
-    Trace format:
-        Trace(S_m) = [(tool_1, status_1), ..., (tool_k, status_k)]
-    
-    On hard failure (timeout, error) or logic block (empty candidates, assertion):
-        - Triggers soft interrupt
-        - Returns partial trace + intermediate observation
-        - Returns control to the policy (which can fall back to atomic tools)
-    """
     
     def __init__(self, tool_simulator_db: Optional[Dict] = None):
-        """
-        Args:
-            tool_simulator_db: Tool simulator database for offline execution
-        """
         self.tool_simulator = tool_simulator_db
     
     def execute_skill(
@@ -331,34 +233,13 @@ class SkillInterpreter:
         input_params: Dict[str, Any],
         max_retries: int = 1,
     ) -> Dict:
-        """
-        Execute a skill and return trace.
-        
-        Args:
-            skill: Skill definition
-            input_params: Input parameters from the policy
-            max_retries: Maximum retries per step
-            
-        Returns:
-            {
-                "success": bool,
-                "trace": [(tool_name, status), ...],
-                "outputs": [output_per_step, ...],
-                "interrupted": bool,
-                "interrupt_step": int or None,
-                "interrupt_reason": str or None,
-                "final_output": str,
-            }
-        """
         trace = []
         outputs = []
         execution_plan = skill.get("execution_plan", [])
         pipe_map = skill.get("pipe_map", {})
 
-        # Defensive: model may generate arguments as list instead of dict
         if not isinstance(input_params, dict):
             if isinstance(input_params, list) and len(input_params) > 0:
-                # Merge list of dicts into one dict
                 merged = {}
                 for item in input_params:
                     if isinstance(item, dict):
@@ -369,13 +250,11 @@ class SkillInterpreter:
 
         select_strategy = input_params.get("select_strategy", "rank-0")
         
-        # Running context for parameter piping
         context = {"input_params": input_params, "step_outputs": []}
         
         for step_idx, step in enumerate(execution_plan):
             tool_name = step["tool_name"]
             
-            # Resolve parameters for this step
             try:
                 step_params = self._resolve_params(step, context, select_strategy)
             except Exception as e:
@@ -390,12 +269,10 @@ class SkillInterpreter:
                     "final_output": "",
                 }
             
-            # Execute the tool (via simulator)
             try:
                 output = self._execute_tool(tool_name, step_params)
                 
                 if output is None or output == "Not found":
-                    # Soft failure - tool returned empty
                     trace.append((tool_name, "empty_output"))
                     outputs.append("")
                     
@@ -429,7 +306,6 @@ class SkillInterpreter:
                         "final_output": "",
                     }
         
-        # All steps completed successfully
         final_output = outputs[-1] if outputs else ""
         return {
             "success": True,
@@ -444,20 +320,16 @@ class SkillInterpreter:
     def _resolve_params(
         self, step: Dict, context: Dict, select_strategy: str
     ) -> Dict:
-        """Resolve parameters for a step using input params and piped outputs."""
         params = {}
         for param_name, source in step.get("params_source", {}).items():
             if source["type"] == "exposed":
-                # Get from input parameters
                 exposed_name = source.get("param_name", param_name)
                 if exposed_name in context["input_params"]:
                     params[param_name] = context["input_params"][exposed_name]
             elif source["type"] == "pipe":
-                # Get from previous step output
                 step_outputs = context["step_outputs"]
                 if step_outputs:
                     last_output = step_outputs[-1]
-                    # Try to parse and extract field
                     params[param_name] = self._extract_from_output(
                         last_output, param_name, select_strategy
                     )
@@ -466,13 +338,11 @@ class SkillInterpreter:
     def _extract_from_output(
         self, output: str, field_name: str, select_strategy: str
     ) -> Any:
-        """Extract a field from a tool output, applying select_strategy if needed."""
         try:
             parsed = json.loads(output) if isinstance(output, str) else output
         except (json.JSONDecodeError, TypeError):
             return output
         
-        # If parsed is a list, apply select_strategy
         if isinstance(parsed, list) and parsed:
             if select_strategy == "rank-0":
                 item = parsed[0]
@@ -482,20 +352,17 @@ class SkillInterpreter:
                 import random
                 item = random.choice(parsed)
             elif select_strategy == "filter":
-                item = parsed[0]  # Default filter selects first
+                item = parsed[0]
             else:
                 item = parsed[0]
             
-            # Try to extract field_name from item
             if isinstance(item, dict) and field_name in item:
                 return item[field_name]
             return item
         
-        # If parsed is a dict, try to get field
         if isinstance(parsed, dict):
             if field_name in parsed:
                 return parsed[field_name]
-            # Try common variants
             for key in parsed:
                 if field_name.lower() in key.lower():
                     return parsed[key]
@@ -503,7 +370,6 @@ class SkillInterpreter:
         return output
     
     def _execute_tool(self, tool_name: str, params: Dict) -> Optional[str]:
-        """Execute a tool using the simulator database."""
         if self.tool_simulator is None:
             return json.dumps({"status": "simulated", "tool": tool_name})
         
@@ -513,7 +379,6 @@ class SkillInterpreter:
         if not tool_data:
             return "Not found"
         
-        # Find matching call by parameter keys
         import hashlib
         param_keys = sorted(params.keys())
         key_hash = hashlib.md5(str(param_keys).encode()).hexdigest()[:12]
@@ -522,8 +387,7 @@ class SkillInterpreter:
         for schema_hash, schema_data in schemas.items():
             calls = schema_data.get("calls", [])
             if calls:
-                # Find closest match by comparing parameter values
-                best_match = calls[0]  # Default to first call
+                best_match = calls[0]
                 for call in calls:
                     call_args = call.get("args", {})
                     if self._params_match(params, call_args):
@@ -533,17 +397,11 @@ class SkillInterpreter:
         return "Not found"
     
     def _params_match(self, query_params: Dict, db_params: Dict) -> bool:
-        """Check if query parameters match database parameters."""
         if not query_params or not db_params:
             return False
-        # Exact key match
         return set(query_params.keys()) == set(db_params.keys()) and \
                all(str(query_params.get(k)) == str(db_params.get(k)) for k in query_params)
 
-
-# ============================================================================
-# Build Augmented Tool Library
-# ============================================================================
 
 def build_augmented_tools(
     all_tools_path: str,
@@ -551,22 +409,14 @@ def build_augmented_tools(
     tool_schemas: Dict[str, Dict],
     skill_config: SkillConfig,
 ) -> List[Dict]:
-    """
-    Build the augmented tool library: A = A_atom ∪ A_skill
-    
-    Atomic tools are preserved as-is; skills are added with proper schemas.
-    """
-    # Load atomic tools
     with open(all_tools_path, "r", encoding="utf-8") as f:
         atomic_tools = json.load(f)
     
-    # Load skill library
     with open(skill_library_path, "r", encoding="utf-8") as f:
         skill_lib = json.load(f)
     
     macros = skill_lib.get("macros", {})
     
-    # Instantiate skills
     skills = []
     for macro_id, macro in macros.items():
         skill = instantiate_skill(macro, tool_schemas, skill_config)
@@ -574,10 +424,8 @@ def build_augmented_tools(
     
     logger.info(f"Instantiated {len(skills)} skills from {len(macros)} macros")
     
-    # Build augmented list
     augmented = []
     
-    # Add atomic tools (preserve original format)
     max_atomic_id = 0
     for tool in atomic_tools:
         augmented.append({
@@ -592,7 +440,6 @@ def build_augmented_tools(
         })
         max_atomic_id = max(max_atomic_id, tool.get("id", 0))
     
-    # Add skills
     for i, skill in enumerate(skills):
         skill_entry = {
             "id": max_atomic_id + 1 + i,
@@ -620,10 +467,6 @@ def build_augmented_tools(
     return augmented
 
 
-# ============================================================================
-# Main
-# ============================================================================
-
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="AdaMacro Step 2: Skill Instantiation")
@@ -638,7 +481,6 @@ def main():
     logger.info("AdaMacro Step 2: Skill Instantiation & Trace-Aware Execution")
     logger.info("=" * 70)
     
-    # Load tool schemas
     tool_schemas = {}
     with open(args.all_tools, "r", encoding="utf-8") as f:
         tools = json.load(f)
@@ -648,23 +490,19 @@ def main():
     
     skill_config = SkillConfig()
     
-    # Build augmented tools
     augmented = build_augmented_tools(
         args.all_tools, args.skill_library, tool_schemas, skill_config
     )
     
-    # Save
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(augmented, f, ensure_ascii=False, indent=2)
     
     logger.info(f"Saved augmented tools to {args.output}")
     
-    # Print summary
     n_atomic = sum(1 for t in augmented if not t.get("is_skill", False))
     n_skill = sum(1 for t in augmented if t.get("is_skill", False))
     logger.info(f"Atomic tools: {n_atomic}, Skills: {n_skill}, Total: {len(augmented)}")
     
-    # Print skill details
     logger.info("\nSkill details:")
     for t in augmented:
         if t.get("is_skill"):

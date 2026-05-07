@@ -1,18 +1,3 @@
-"""
-Standard GRPO Training (Baseline for Figure 1d)
-=================================================
-
-Clean GRPO training with R = R_task only.
-
-Differences from AdaMacro GRPO (step4_grpo_training.py):
-  - Reward: R_task only (no skill_bonus, no R_efficiency)
-  - System prompt: uniform tool list (no skill prioritization, no [SKILL] tags)
-  - Rollout groups: varying temperature only (no oracle seeding, no skill bias)
-  - No skill-biased resampling
-
-Usage:
-  python scripts/step4_standard_grpo.py --model qwen2.5-7b --epochs 1 --group-size 2
-"""
 
 import argparse
 import bisect
@@ -46,16 +31,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# TaskReward: R = R_task only
-# ═══════════════════════════════════════════════════════════════════════
-
 class TaskReward:
-    """
-    R(τ) = R_task  (gt_tools coverage with fuzzy matching + order bonus).
-
-    No skill_bonus, no R_efficiency — pure task completion reward.
-    """
 
     @staticmethod
     def _tokenize_tool(name: str) -> set:
@@ -89,7 +65,6 @@ class TaskReward:
         num_decision_steps: int,
         completed: bool,
     ) -> Tuple[float, Dict]:
-        # Collect all tools actually invoked (including inside skills)
         all_used = set(normalize_tool_name(t) for t in used_tools)
         for trace in skill_traces:
             for tool_name, _ in trace:
@@ -102,7 +77,6 @@ class TaskReward:
             for tool_name, _ in trace:
                 used_list.append(normalize_tool_name(tool_name))
 
-        # 0-step penalty
         if num_decision_steps == 0:
             return 0.0, {"r_task": 0.0, "note": "0-step penalty"}
 
@@ -120,7 +94,6 @@ class TaskReward:
 
             base_coverage = min(total_credit / max(len(gt_set), 1), 1.0)
 
-            # Position-aware order bonus (LIS)
             gt_match_positions = []
             for gi, gt in enumerate(gt_list):
                 best_score = 0.0
@@ -165,10 +138,6 @@ class TaskReward:
         return total, {"r_task": round(r_task, 4)}
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Training
-# ═══════════════════════════════════════════════════════════════════════
-
 def train_standard_grpo(
     model_name: str,
     sft_checkpoint_dir: str,
@@ -179,7 +148,6 @@ def train_standard_grpo(
     from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
     from peft import PeftModel, LoraConfig, get_peft_model, TaskType
 
-    # ── Model loading ────────────────────────────────────────────────
     model_path = get_model_path(model_name)
     logger.info(f"Loading base model: {model_path}")
 
@@ -212,18 +180,15 @@ def train_standard_grpo(
     model.print_trainable_parameters()
     device = next(model.parameters()).device
 
-    # ── Environment ──────────────────────────────────────────────────
     env = ToolEnvironment(AUGMENTED_TOOLS_PATH, TOOL_SIMULATOR_DB_PATH, RL_DATASET_PATH)
     reward_fn = TaskReward()
 
-    # ── Tool descriptions (uniform, no skill tags) ───────────────────
     with open(AUGMENTED_TOOLS_PATH, "r") as f:
         all_augmented_tools = json.load(f)
 
     tool_desc_map = {}
     for t in all_augmented_tools:
         norm_name = normalize_tool_name(t["name"])
-        # No [SKILL] tag, no chain info — uniform treatment
         params = t.get("parameters_schema", {})
         param_str = ""
         if params:
@@ -236,18 +201,15 @@ def train_standard_grpo(
         )
 
     def build_system_prompt(task_name: str) -> str:
-        """Build per-prompt system prompt. Uniform tool list, no skill bias."""
         lines = []
         seen = set()
 
-        # Category-based tool selection (same logic, no skill priority)
         task_lower = task_name.lower().replace("-", "_")
         category_keywords = set()
         for part in task_lower.split("_"):
             if len(part) >= 3:
                 category_keywords.add(part)
 
-        # Add tools matching task category
         for tn, desc in tool_desc_map.items():
             if tn in seen:
                 continue
@@ -258,7 +220,6 @@ def train_standard_grpo(
             if len(seen) >= 40:
                 break
 
-        # Fill remaining with random tools
         other_tools = [tn for tn in tool_desc_map if tn not in seen]
         random.shuffle(other_tools)
         for tn in other_tools:
@@ -280,7 +241,6 @@ def train_standard_grpo(
             "After receiving all tool responses, provide a brief text summary to finish."
         )
 
-    # ── Training prompts ─────────────────────────────────────────────
     with open(RL_DATASET_PATH, "r") as f:
         rl_data = json.load(f)
 
@@ -296,7 +256,6 @@ def train_standard_grpo(
             })
     logger.info(f"Training prompts: {len(train_prompts)}")
 
-    # ── Hyperparameters ──────────────────────────────────────────────
     G = grpo_config.group_size
     num_epochs = grpo_config.num_epochs
     lr = grpo_config.learning_rate
@@ -324,7 +283,6 @@ def train_standard_grpo(
         f"grad_accum={grad_accum}  total_steps≈{total_steps}"
     )
 
-    # ── Training loop ────────────────────────────────────────────────
     global_step = 0
     acc_loss = acc_reward = 0.0
     acc_cnt = 0
@@ -341,12 +299,10 @@ def train_standard_grpo(
             task_name = pdata["task_name"]
             system_prompt = build_system_prompt(task_name)
 
-            # ── Generate G rollouts (varying temperature, NO skill bias) ──
             rollouts = []
             for g in range(G):
                 t = base_temp * (0.6 + g * 0.3)
                 t = max(0.1, min(t, 1.5))
-                # g=G-1: higher temperature for exploration
                 if g == G - 1:
                     t = min(base_temp * 1.8, 2.0)
 
@@ -355,7 +311,7 @@ def train_standard_grpo(
                     system_prompt, user_prompt,
                     max_turns=max_turns, max_new_tokens=max_gen_tok,
                     temperature=t, device=device,
-                    oracle_first_tool=None,   # NO oracle seeding
+                    oracle_first_tool=None,
                     gt_tools_len=len(gt_tools),
                 )
                 used_tools = [name for name, _ in rollout["actions"]]
@@ -370,7 +326,6 @@ def train_standard_grpo(
                 rollout["reward_breakdown"] = breakdown
                 rollouts.append(rollout)
 
-            # ── 0-step resample (normal prompt, NO skill bias) ──
             has_any_action = any(r["num_steps"] > 0 for r in rollouts)
             resample_attempts = 0
             while not has_any_action and resample_attempts < 3:
@@ -379,7 +334,7 @@ def train_standard_grpo(
                 t = min(t, 2.0)
                 rollout = run_rollout(
                     model, tokenizer, env,
-                    system_prompt, user_prompt,  # normal prompt
+                    system_prompt, user_prompt,
                     max_turns=max_turns, max_new_tokens=max_gen_tok,
                     temperature=t, device=device,
                     oracle_first_tool=None,
@@ -402,9 +357,7 @@ def train_standard_grpo(
                             break
                     has_any_action = True
 
-            # NO skill resample — this is standard GRPO
 
-            # ── Group-relative advantage ──
             rewards = [r["reward"] for r in rollouts]
             mu = sum(rewards) / len(rewards)
             raw_std = math.sqrt(sum((r - mu)**2 for r in rewards) / len(rewards))
@@ -417,7 +370,6 @@ def train_standard_grpo(
                     r["advantage"] = (rewards[i] - mu) / std
                     r["advantage"] = max(-3.0, min(3.0, r["advantage"]))
 
-            # ── Log ──
             exec_logger.log_prompt(
                 epoch, pidx, global_step, user_prompt, gt_tools, rollouts)
 
@@ -428,7 +380,6 @@ def train_standard_grpo(
                     f"mu={mu:.3f} std={raw_std:.3f}"
                 )
 
-            # ── Policy gradient ──
             model.train()
             for rollout in rollouts:
                 adv = rollout["advantage"]
@@ -457,7 +408,6 @@ def train_standard_grpo(
                     acc_reward += rollout["reward"]
                     acc_cnt += 1
 
-            # ── Optimizer step ──
             if (pidx + 1) % grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad], 1.0)
@@ -479,14 +429,12 @@ def train_standard_grpo(
                 acc_loss = acc_reward = 0.0
                 acc_cnt = 0
 
-                # Periodic save
                 if global_step % save_steps == 0:
                     ckpt = os.path.join(output_dir, f"checkpoint-{global_step}")
                     model.save_pretrained(ckpt)
                     tokenizer.save_pretrained(ckpt)
                     logger.info(f"  Saved checkpoint: {ckpt}")
 
-        # End-of-epoch: flush remaining gradients
         remaining = len(train_prompts) % grad_accum
         if remaining > 0:
             torch.nn.utils.clip_grad_norm_(
@@ -496,16 +444,11 @@ def train_standard_grpo(
             optimizer.zero_grad()
             global_step += 1
 
-    # Final save
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     exec_logger.save_summary()
     logger.info(f"Training complete. Final checkpoint: {output_dir}")
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# CLI
-# ═══════════════════════════════════════════════════════════════════════
 
 def main():
     parser = argparse.ArgumentParser(description="Standard GRPO Training (R=R_task only)")

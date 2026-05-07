@@ -10,13 +10,6 @@
 #SBATCH --output=logs/fig1d_sft_%j.out
 #SBATCH --error=logs/fig1d_sft_%j.err
 
-# ===========================================================================
-# Figure 1 Panel (d): Counterfactual rollout — SFT policy
-# ===========================================================================
-# Usage:
-#   sbatch run_figure1d_sft.sh                    # Default: qwen2.5-7b, 200 prompts
-#   sbatch run_figure1d_sft.sh qwen2.5-7b 200    # Explicit
-# ===========================================================================
 
 MODEL=${1:-"qwen2.5-7b"}
 N_PROMPTS=${2:-200}

@@ -1,24 +1,3 @@
-"""
-AdaMacro Step 4: GIPO Training — 2-GPU Version for 7B/8B Models
-================================================================
-
-This script adapts GIPO training for larger models (Qwen2.5-7B, Llama3.1-8B)
-that require 2 GPUs to fit in memory.
-
-Key differences from single-GPU step4_gipo_training.py:
-  - Model parallelism via device_map="auto" with explicit max_memory per GPU
-  - Gradient checkpointing to reduce activation memory
-  - Adjusted hyperparameters (lower lr, smaller LoRA, shorter sequences)
-  - NOT using DDP/torchrun — rollout generation is serial, so model
-    parallelism (splitting layers across GPUs) is the correct approach
-
-All reward, rollout, and imagination logic is imported from the original
-step4_gipo_training.py to avoid code duplication.
-
-Usage:
-  python step4_gipo_training_2gpu.py --model qwen2.5-7b
-  python step4_gipo_training_2gpu.py --model llama3.1-8b --epochs 2 --lr 1e-6
-"""
 
 import json
 import logging
@@ -37,7 +16,6 @@ from configs.config import (
     ADAMACRO_OUTPUT_DIR, GIPO7BConfig, get_model_path, DEFAULT_MODEL,
 )
 
-# Import all shared components from the original GIPO training script
 from step4_gipo_training import (
     ExecutionLogger,
     AdaMacroReward,
@@ -56,22 +34,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# 2-GPU Model Loading
-# ============================================================================
-
 def load_model_2gpu(model_path: str, sft_checkpoint_dir: str, config: GIPO7BConfig):
-    """
-    Load a 7B/8B model across 2 GPUs using model parallelism.
-
-    Strategy:
-      - device_map="auto" splits layers across available GPUs
-      - max_memory limits per-GPU usage to leave room for KV cache & gradients
-      - Gradient checkpointing trades compute for memory
-      - LoRA keeps trainable params small (~0.5% of 7B)
-
-    Returns: model, tokenizer, device (device of the first parameter)
-    """
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import PeftModel, LoraConfig, get_peft_model, TaskType
@@ -81,22 +44,18 @@ def load_model_2gpu(model_path: str, sft_checkpoint_dir: str, config: GIPO7BConf
     if n_gpus < 2:
         logger.warning("Less than 2 GPUs available! Falling back to single GPU.")
 
-    # Set max_memory per GPU — leave ~15GB headroom for gradients/KV cache/activations
     max_memory = {}
     for i in range(n_gpus):
         total_mem = torch.cuda.get_device_properties(i).total_memory / (1024**3)
-        # Use ~80% of each GPU (e.g., 64GB out of 80GB H100)
         max_memory[i] = f"{int(total_mem * 0.80)}GiB"
-    max_memory["cpu"] = "32GiB"  # offload buffer
+    max_memory["cpu"] = "32GiB"
     logger.info(f"Max memory allocation: {max_memory}")
 
-    # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         model_path, trust_remote_code=True, padding_side="right")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load base model with model parallelism
     if os.path.exists(os.path.join(sft_checkpoint_dir, "adapter_config.json")):
         logger.info(f"Loading SFT LoRA from {sft_checkpoint_dir}")
         base = AutoModelForCausalLM.from_pretrained(
@@ -115,7 +74,6 @@ def load_model_2gpu(model_path: str, sft_checkpoint_dir: str, config: GIPO7BConf
             trust_remote_code=True,
         )
 
-    # Log device map
     if hasattr(model, "hf_device_map"):
         devices_used = set(str(v) for v in model.hf_device_map.values())
         logger.info(f"Model device map uses: {devices_used} "
@@ -123,12 +81,10 @@ def load_model_2gpu(model_path: str, sft_checkpoint_dir: str, config: GIPO7BConf
 
     model.config.use_cache = False
 
-    # Enable gradient checkpointing — critical for 7B on 2×GPU
     if config.gradient_checkpointing:
         model.gradient_checkpointing_enable()
         logger.info("Gradient checkpointing enabled")
 
-    # Apply LoRA
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=config.lora_rank,
@@ -140,16 +96,11 @@ def load_model_2gpu(model_path: str, sft_checkpoint_dir: str, config: GIPO7BConf
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    # Get device of first parameter (inputs should go here)
     device = next(model.parameters()).device
     logger.info(f"Input tensor device: {device}")
 
     return model, tokenizer, device
 
-
-# ============================================================================
-# Training Loop (adapted for 2-GPU)
-# ============================================================================
 
 def train_grpo(
     model_name: str,
@@ -161,16 +112,13 @@ def train_grpo(
     import torch
     from transformers import get_cosine_schedule_with_warmup
 
-    # ---------------------------------------------------------------- model (2-GPU)
     model_path = get_model_path(model_name)
     logger.info(f"Loading model for 2-GPU: {model_path}")
     model, tokenizer, device = load_model_2gpu(model_path, sft_checkpoint_dir, grpo_config)
 
-    # ---------------------------------------------------------------- env
     env = ToolEnvironment(AUGMENTED_TOOLS_PATH, TOOL_SIMULATOR_DB_PATH, RL_DATASET_PATH)
     reward_fn = AdaMacroReward(grpo_config, skill_definitions=env.skills)
 
-    # Build tool description matching SFT format (with parameters)
     with open(AUGMENTED_TOOLS_PATH, "r") as f:
         all_augmented_tools = json.load(f)
 
@@ -255,7 +203,6 @@ def train_grpo(
             "After receiving all tool responses, provide a brief text summary to finish."
         )
 
-    # ---------------------------------------------------------------- prompts
     with open(RL_DATASET_PATH, "r") as f:
         rl_data = json.load(f)
     episodes = rl_data.get("episodes", [])
@@ -272,7 +219,6 @@ def train_grpo(
             })
     logger.info(f"Training prompts: {len(train_prompts)}")
 
-    # ---------------------------------------------------------------- hyper-params
     G = grpo_config.group_size
     num_epochs = grpo_config.num_epochs
     lr = grpo_config.learning_rate
@@ -289,7 +235,6 @@ def train_grpo(
         [p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=0.01)
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, max(total_steps, 1))
 
-    # ---------------------------------------------------------------- execution logger
     log_path = os.path.join(output_dir, "execution_log.jsonl")
     exec_logger = ExecutionLogger(log_path)
 
@@ -302,14 +247,11 @@ def train_grpo(
                 f"step_cap={grpo_config.gipo_step_reward_cap} "
                 f"total_cap={grpo_config.gipo_total_reward_cap}")
 
-    # Log GPU memory before training
     for i in range(torch.cuda.device_count()):
         alloc = torch.cuda.memory_allocated(i) / (1024**3)
         reserved = torch.cuda.memory_reserved(i) / (1024**3)
         logger.info(f"GPU {i}: allocated={alloc:.1f}GB  reserved={reserved:.1f}GB")
 
-    # ---------------------------------------------------------------- training loop
-    # (identical to step4_gipo_training.py from here)
     global_step = 0
     acc_loss = acc_reward = acc_steps_ep = acc_skill_r = 0.0
     acc_img_steps = 0.0
@@ -324,7 +266,6 @@ def train_grpo(
             user_prompt = pdata["user_prompt"]
             gt_tools = pdata["gt_tools"]
 
-            # ========== GIPO Phase 1: Generate base rollouts + branches ==========
             model.eval()
             rollouts = []
 
@@ -358,7 +299,6 @@ def train_grpo(
                 ro["reward_breakdown"] = bd
                 return rw, bd
 
-            # --- Base rollout 0: skill-biased ---
             t0 = max(0.1, base_temp * 0.8)
             base_0 = run_rollout(
                 model, tokenizer, env,
@@ -370,7 +310,6 @@ def train_grpo(
             base_0["rollout_type"] = "base"
             _compute_reward(base_0)
 
-            # --- Base rollout 1: oracle-seeded ---
             t1 = max(0.1, base_temp * 1.2)
             oracle_first = None
             if gt_tools:
@@ -393,7 +332,6 @@ def train_grpo(
 
             rollouts = [base_0, base_1]
 
-            # --- 0-step resample ---
             has_any_action = any(r["num_steps"] > 0 for r in rollouts)
             resample_attempts = 0
             while not has_any_action and resample_attempts < 3:
@@ -415,7 +353,6 @@ def train_grpo(
                             break
                     has_any_action = True
 
-            # --- GIPO: counterfactual branches ---
             n_branches = 0
             for ri, base_ro in enumerate(list(rollouts)):
                 if base_ro["num_steps"] == 0:
@@ -511,7 +448,6 @@ def train_grpo(
                     rollouts.append(branch)
                     n_branches += 1
 
-            # ========== GIPO Phase 1.5: Imagination Reward ==========
             import re
             img_scale = grpo_config.gipo_step_reward_scale
             img_step_cap = grpo_config.gipo_step_reward_cap
@@ -539,7 +475,6 @@ def train_grpo(
             for ro in rollouts:
                 ro["reward"] = max(ro["reward"], 0.0)
 
-            # ========== Phase 2: group-relative advantage ==========
             rewards = [r["reward"] for r in rollouts]
             mu = sum(rewards) / len(rewards)
             raw_std = math.sqrt(sum((r - mu)**2 for r in rewards) / len(rewards))
@@ -554,7 +489,6 @@ def train_grpo(
                     r["advantage"] = (rewards[i] - mu) / std
                     r["advantage"] = max(-3.0, min(3.0, r["advantage"]))
 
-            # ========== Logging ==========
             show_detail = pidx < 5 or pidx % 50 == 0
             if show_detail:
                 logger.info(f"  [prompt {pidx}] gt_tools={gt_tools[:4]}... "
@@ -578,7 +512,6 @@ def train_grpo(
                     )
             exec_logger.log_prompt(epoch, pidx, global_step, user_prompt, gt_tools, rollouts)
 
-            # ========== Phase 3: policy gradient ==========
             model.train()
             prompt_loss = 0.0
 
@@ -606,7 +539,6 @@ def train_grpo(
                     pg_loss.backward()
                     prompt_loss += pg_loss.item() * n_rollouts * grad_accum
 
-            # Stats
             n_rollouts = len(rollouts)
             acc_loss += prompt_loss
             acc_reward += sum(rewards) / len(rewards)
@@ -617,7 +549,6 @@ def train_grpo(
             acc_img_steps += n_branches
             acc_cnt += 1
 
-            # ========== Phase 4: optimizer step ==========
             if (pidx + 1) % grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
@@ -633,7 +564,6 @@ def train_grpo(
                     br = acc_img_steps / max(acc_cnt, 1)
                     clr = scheduler.get_last_lr()[0]
 
-                    # Log GPU memory periodically
                     mem_info = ""
                     for gi in range(torch.cuda.device_count()):
                         alloc = torch.cuda.memory_allocated(gi) / (1024**3)
@@ -659,7 +589,6 @@ def train_grpo(
                     tokenizer.save_pretrained(sp)
                     logger.info(f"Checkpoint → {sp}")
 
-        # Flush remaining accumulated gradients at epoch end
         if (pidx + 1) % grad_accum != 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -670,24 +599,15 @@ def train_grpo(
 
         logger.info(f"Epoch {epoch+1} done.  best_reward={best_reward:.3f}")
 
-    # Final save
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     exec_logger.save_summary()
     logger.info(f"GIPO-2GPU complete → {output_dir}  best_reward={best_reward:.3f}")
 
 
-# ============================================================================
-# Backward-compatible wrapper
-# ============================================================================
-
 def generate_grpo_rollouts(*args, **kwargs):
     logger.info("Online GRPO: rollouts are generated on-the-fly, skipping offline generation.")
 
-
-# ============================================================================
-# Main
-# ============================================================================
 
 def main():
     import argparse

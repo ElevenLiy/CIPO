@@ -11,13 +11,6 @@
 #SBATCH --error=logs/adamacro_2gpu_%j.err
 #SBATCH --partition=fengl2
 
-# ===========================================================================
-# AdaMacro: 2-GPU Runner (for 7B/8B models)
-# ===========================================================================
-# Usage:
-#   sbatch run_adamacro_2gpu.sh qwen2.5-7b 3,4,5
-#   sbatch run_adamacro_2gpu.sh llama3.1-8b 3,4,5
-# ===========================================================================
 
 MODEL=${1:-"qwen2.5-7b"}
 STEPS=${2:-"3,4,5"}
@@ -42,7 +35,6 @@ source $CONDA_PREFIX/etc/profile.d/conda.sh
 conda activate tool
 
 
-# Single-process with device_map="auto" model parallelism (NOT DDP)
 python scripts/run_pipeline.py \
     --model ${MODEL} \
     --steps ${STEPS} \

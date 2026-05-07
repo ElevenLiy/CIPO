@@ -1,21 +1,3 @@
-"""
-AdaMacro: GIPO Pipeline Runner for LLaMA 3.2-3B (Single GPU)
-==============================================================
-
-Same as run_pipeline_gipo.py but uses GIPO3BConfig tuned for LLaMA 3.2-3B
-and saves checkpoints/results to separate directories.
-
-Steps 1-3 are identical. Step 4 uses GIPO with GIPO3BConfig.
-Step 5 evaluates from GIPO checkpoint.
-
-Checkpoint directory:  checkpoints/gipo_llama32_3b/
-Eval directory:        eval_gipo_llama32_3b_results/
-
-Usage:
-  python run_pipeline_gipo_llama.py --model llama3.2-3b --steps 1,2,3,4,5
-  python run_pipeline_gipo_llama.py --model llama3.2-3b --steps 4,5
-  python run_pipeline_gipo_llama.py --model llama3.2-3b --steps 5 --stage sft
-"""
 
 import argparse
 import logging
@@ -48,37 +30,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# LLaMA-specific checkpoint directories (independent from Qwen)
-# ============================================================================
-
 def _model_short(model_name: str) -> str:
-    """Generate a unique short name for checkpoint directories.
-
-    Examples:
-        llama3.2-3b  -> llama32_3b
-        llama3.1-8b  -> llama31_8b
-        qwen2.5-1.5b -> qwen25_1.5b
-    """
     return model_name.replace(".", "").replace("-", "_")
 
 
 def _gipo_checkpoint_dir(model_name: str) -> str:
-    """Get GIPO checkpoint dir: checkpoints/gipo_llama32_3b/"""
     return os.path.join(CHECKPOINT_DIR, f"gipo_{_model_short(model_name)}")
 
 
 def _gipo_eval_dir(model_name: str) -> str:
-    """Get GIPO eval dir: eval_gipo_llama32_3b_results/"""
     return os.path.join(ADAMACRO_OUTPUT_DIR, f"eval_gipo_{_model_short(model_name)}_results")
 
 
-# ============================================================================
-# Steps 1-3 are identical to other pipelines
-# ============================================================================
-
 def run_step1(args):
-    """BPE Macro Mining."""
     from step1_bpe_mining import load_successful_sequences, BPEMacroMiner, load_tool_schemas
     import json
 
@@ -126,7 +90,6 @@ def run_step1(args):
 
 
 def run_step2(args):
-    """Skill Instantiation."""
     from step2_skill_instantiation import build_augmented_tools
     import json
 
@@ -146,7 +109,6 @@ def run_step2(args):
 
 
 def run_step3(args):
-    """SFT Training."""
     from step3_sft_training import generate_sft_data, train_sft
 
     sft_config = SFTConfig()
@@ -166,12 +128,7 @@ def run_step3(args):
     logger.info(f"Step 3 done: SFT checkpoint -> {sft_dir}")
 
 
-# ============================================================================
-# Step 4: GIPO Training (single GPU, GIPO3BConfig for LLaMA 3.2-3B)
-# ============================================================================
-
 def run_step4(args):
-    """GIPO Training for LLaMA 3.2-3B (single GPU, GIPO3BConfig)."""
     from step4_gipo_training import generate_grpo_rollouts, train_grpo
 
     gipo_config = GIPO3BConfig()
@@ -179,9 +136,7 @@ def run_step4(args):
     if args.lr: gipo_config.learning_rate = args.lr
     if args.group_size: gipo_config.group_size = args.group_size
 
-    # SFT checkpoint is shared (same SFT for GRPO and GIPO)
     sft_dir = os.path.join(CHECKPOINT_DIR, "sft", args.model)
-    # GIPO checkpoint goes to a separate directory
     gipo_dir = _gipo_checkpoint_dir(args.model)
     os.makedirs(gipo_dir, exist_ok=True)
 
@@ -196,12 +151,7 @@ def run_step4(args):
     logger.info(f"Step 4 done: GIPO checkpoint -> {gipo_dir}")
 
 
-# ============================================================================
-# Step 5: Evaluation
-# ============================================================================
-
 def run_step5(args):
-    """Evaluation (from GIPO checkpoint)."""
     from step5_evaluation import evaluate
 
     eval_config = EvalConfig(
@@ -214,7 +164,6 @@ def run_step5(args):
     elif args.stage == "sft":
         lora_path = os.path.join(CHECKPOINT_DIR, "sft", args.model)
     else:
-        # Default: evaluate from GIPO checkpoint
         lora_path = _gipo_checkpoint_dir(args.model)
 
     eval_dir = _gipo_eval_dir(args.model)
@@ -247,19 +196,16 @@ def main():
                        choices=["base", "sft", "grpo"],
                        help="Evaluation stage (grpo = GIPO checkpoint)")
 
-    # BPE params
     parser.add_argument("--max-merges", type=int, default=50)
     parser.add_argument("--min-freq", type=int, default=3)
     parser.add_argument("--max-macro-len", type=int, default=6)
 
-    # Training params
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lora-rank", type=int, default=None)
     parser.add_argument("--group-size", type=int, default=None)
 
-    # Eval params
     parser.add_argument("--max-turns", type=int, default=30)
     parser.add_argument("--max-atomic-calls", type=int, default=50)
     parser.add_argument("--max-episodes", type=int, default=100)
@@ -269,7 +215,6 @@ def main():
     ensure_dirs()
     print_config()
 
-    # Create LLaMA GIPO-specific dirs
     os.makedirs(_gipo_checkpoint_dir(args.model), exist_ok=True)
     os.makedirs(_gipo_eval_dir(args.model), exist_ok=True)
 

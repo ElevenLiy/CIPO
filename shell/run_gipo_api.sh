@@ -11,31 +11,11 @@
 #SBATCH --error=logs/gipo_api_%j.err
 #SBATCH --partition=fengl2
 
-# ===========================================================================
-# GIPO-API Experiment Runner (API-based tool simulation)
-# ===========================================================================
-# Usage:
-#   sbatch run_gipo_api.sh                                # Default: qwen2.5-7b, all steps
-#   sbatch run_gipo_api.sh qwen2.5-1.5b 1,2,3,4,5        # Specify model and steps
-#   sbatch run_gipo_api.sh qwen2.5-1.5b 4,5               # Only GIPO-API training + eval
-#   sbatch run_gipo_api.sh qwen2.5-7b 5 sft               # Evaluate SFT only
-#
-# Checkpoint directories:
-#   GIPO-API checkpoints: checkpoints/gipo_api_qwen1.5b/
-#   GIPO-API eval results: eval_gipo_api_results/
-#   (SFT checkpoints are shared with run_adamacro.sh)
-#
-# Note: This variant uses an external LLM API (DashScope/Qwen) to simulate
-# tool outputs instead of the static tool_simulator_database. Requires
-# network access to the API endpoint.
-# ===========================================================================
 
-# --- Parameters ---
 MODEL=${1:-"qwen2.5-7b"}
 STEPS=${2:-"1,2,3,4,5"}
 STAGE=${3:-"grpo"}
 
-# --- Project paths ---
 ADAMACRO_DIR="/path/to/CIPO"
 cd ${ADAMACRO_DIR}
 
@@ -53,11 +33,9 @@ echo "Stage:      ${STAGE}"
 echo "Time:       $(date)"
 echo "============================================================"
 
-# --- Environment setup ---
 source $CONDA_PREFIX/etc/profile.d/conda.sh
 conda activate tool
 
-# --- Run GIPO-API pipeline ---
 python scripts/run_pipeline_gipo_api.py \
     --model ${MODEL} \
     --steps ${STEPS} \

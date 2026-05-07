@@ -11,12 +11,6 @@
 #SBATCH --error=logs/traject_gipo_llama8b_2gpu_%j.err
 #SBATCH --partition=fengl2
 
-# ===========================================================================
-# Traject-bench Dataset — GIPO 2-GPU — LLaMA 3.1-8B
-# ===========================================================================
-# Checkpoint: outputs/traject/checkpoints/gipo_2gpu_llama31_8b/
-# Eval:       outputs/traject/eval_gipo_2gpu_llama31_8b_results/
-# ===========================================================================
 
 MODEL="llama3.1-8b"
 STEPS=${1:-"3,4,5"}

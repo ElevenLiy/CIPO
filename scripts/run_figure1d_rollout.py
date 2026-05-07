@@ -44,9 +44,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Match project convention: add code/ to sys.path
-SCRIPT_DIR = Path(__file__).resolve().parent          # .../code/scripts/
-CODE_DIR = SCRIPT_DIR.parent                          # .../code/
+SCRIPT_DIR = Path(__file__).resolve().parent
+CODE_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(CODE_DIR))
 
 from configs.config import (
@@ -64,7 +63,6 @@ OUTPUT_DIR = CODE_DIR.parent / "figure1" / "outputs"
 
 
 def load_prompts(n_prompts: int, seed: int):
-    """Load n_prompts from the RL dataset (successful episodes only)."""
     with open(RL_DATASET_PATH, "r") as f:
         rl_data = json.load(f)
 
@@ -90,21 +88,13 @@ def load_prompts(n_prompts: int, seed: int):
 
 
 def load_prompts_from_replay(replay_path: str, all_prompts_seed: int):
-    """
-    Reproduce the exact prompt list from a previous run by replaying the
-    same seed-based shuffle, then filter to only the prompt_indices that
-    produced divergence states.
-    """
     with open(replay_path, "r") as f:
         prev_data = json.load(f)
 
     prev_records = prev_data.get("records", [])
-    # Get the unique prompt_indices and original n_prompts
     used_indices = sorted(set(r["prompt_idx"] for r in prev_records))
-    # Infer n_prompts from the max index + 1
     n_prompts = max(used_indices) + 1
 
-    # Reproduce the same prompt list
     all_prompts = load_prompts(n_prompts, seed=all_prompts_seed)
 
     logger.info(f"Replay: {len(used_indices)} prompts with divergence states "
@@ -113,7 +103,6 @@ def load_prompts_from_replay(replay_path: str, all_prompts_seed: int):
 
 
 def build_system_prompt(env, tool_desc_map, norm_skill_names, task_name):
-    """Build per-prompt system prompt (same logic as train_grpo)."""
     lines = []
     seen = set()
 
@@ -170,16 +159,11 @@ def build_system_prompt(env, tool_desc_map, norm_skill_names, task_name):
 def run_experiment(model_name: str, policy_name: str, lora_path: str,
                    n_prompts: int, seed: int = 42,
                    replay_from: str = None):
-    """
-    Main experiment: for each prompt, generate base rollout, find divergence
-    state, fork counterfactual branch, compare rewards.
-    """
     import torch
 
     random.seed(seed)
     torch.manual_seed(seed)
 
-    # ── Load model ──
     model_path = get_model_path(model_name)
     logger.info(f"Loading model: {model_path}")
     logger.info(f"Policy: {policy_name}, LoRA: {lora_path}")
@@ -193,13 +177,11 @@ def run_experiment(model_name: str, policy_name: str, lora_path: str,
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load LoRA checkpoint (fallback: check checkpoint-* subdirs)
     resolved_lora = None
     if lora_path:
         if os.path.exists(os.path.join(lora_path, "adapter_config.json")):
             resolved_lora = lora_path
         else:
-            # Try latest checkpoint-N subdirectory
             import glob
             ckpt_dirs = sorted(
                 glob.glob(os.path.join(lora_path, "checkpoint-*")),
@@ -229,12 +211,10 @@ def run_experiment(model_name: str, policy_name: str, lora_path: str,
     device = next(model.parameters()).device
     logger.info(f"Model loaded on {device}")
 
-    # ── Environment ──
     env = ToolEnvironment(AUGMENTED_TOOLS_PATH, TOOL_SIMULATOR_DB_PATH, RL_DATASET_PATH)
     config = GRPOConfig()
     reward_fn = AdaMacroReward(config, skill_definitions=env.skills)
 
-    # Build tool descriptions
     with open(AUGMENTED_TOOLS_PATH, "r") as f:
         all_tools = json.load(f)
 
@@ -263,7 +243,6 @@ def run_experiment(model_name: str, policy_name: str, lora_path: str,
             f"- {tag}{norm_name}: {t.get('description','')[:100]}{chain_str}{param_str}"
         )
 
-    # Build skill chains for counterfactual lookup
     skill_chains = {}
     for sname, sdef in env.skills.items():
         chain = sdef.get("tool_chain", [])
@@ -271,14 +250,12 @@ def run_experiment(model_name: str, policy_name: str, lora_path: str,
             chain = [s.get("tool_name", "") for s in sdef.get("execution_plan", [])]
         skill_chains[sname] = [normalize_tool_name(t) for t in chain]
 
-    # ── Load prompts ──
     prompt_filter = None
     if replay_from:
         prompts, prompt_filter = load_prompts_from_replay(replay_from, seed)
     else:
         prompts = load_prompts(n_prompts, seed)
 
-    # ── Compute reward helper ──
     def compute_reward(ro, gt_tools):
         ut = [name for name, _ in ro["actions"]]
         sn = list(ro.get("skill_names_used", []))
@@ -294,7 +271,6 @@ def run_experiment(model_name: str, policy_name: str, lora_path: str,
         )
         return rw, bd
 
-    # ── Run rollouts ──
     max_turns = 10
     max_gen_tok = 512
     temperature = 0.7
@@ -439,9 +415,7 @@ def run_experiment(model_name: str, policy_name: str, lora_path: str,
         if not found_any:
             n_no_branch += 1
 
-    # ── Main loop ──
     for pi, pdata in enumerate(prompts):
-        # If replaying, only process prompts that had divergence states
         if prompt_filter is not None and pi not in prompt_filter:
             continue
 
@@ -457,7 +431,6 @@ def run_experiment(model_name: str, policy_name: str, lora_path: str,
             "Check the [SKILL] entries in the tool list first."
         )
 
-        # Base rollout 1: normal
         with torch.no_grad():
             base_0 = run_rollout(
                 model, tokenizer, env,
@@ -468,7 +441,6 @@ def run_experiment(model_name: str, policy_name: str, lora_path: str,
             )
         process_base_rollout(base_0, gt_tools, pi, rollout_tag="normal")
 
-        # Base rollout 2: skill-biased
         with torch.no_grad():
             base_1 = run_rollout(
                 model, tokenizer, env,
@@ -486,7 +458,6 @@ def run_experiment(model_name: str, policy_name: str, lora_path: str,
                 f"no_branch={n_no_branch}"
             )
 
-    # ── Compute results ──
     n_total = n_skill_better + n_comparable + n_atomic_better
     if n_total == 0:
         logger.warning("No branches generated!")
@@ -496,7 +467,6 @@ def run_experiment(model_name: str, policy_name: str, lora_path: str,
     pct_comp = round(n_comparable / n_total * 100, 1)
     pct_atomic = round(n_atomic_better / n_total * 100, 1)
 
-    # Skill invocation rate per category
     sir = {}
     for cat in ["skill_better", "comparable", "atomic_better"]:
         cat_records = [r for r in records if r["category"] == cat]
@@ -556,12 +526,10 @@ def save_result(result, policy_name):
     compact_path = OUTPUT_DIR / f"exp_c_{policy_name}.json"
     full_path = OUTPUT_DIR / f"exp_c_full_{policy_name}.json"
 
-    # Full result (with records)
     with open(full_path, "w") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
     logger.info(f"Full results saved to {full_path}")
 
-    # Compact result for plotting (no records)
     compact = {k: v for k, v in result.items() if k != "records"}
     with open(compact_path, "w") as f:
         json.dump(compact, f, indent=2, ensure_ascii=False)

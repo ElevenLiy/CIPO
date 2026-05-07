@@ -1,16 +1,3 @@
-"""
-AdaMacro Step 1: BPE-style Macro Mining with Budget Constraint
-===============================================================
-
-Implements the budgeted BPE algorithm from Section 2.1 of the paper:
-- Extract successful trajectories and map them to tool token sequences
-- Abstract each tool call to "tool_name[key_signature]" tokens
-- Iteratively merge the most frequent adjacent pairs under a budget K
-- Prune low-utility macros to control vocabulary size
-
-Input:  rl_dataset (with tool sequences from successful episodes)
-Output: skill_library.json (discovered macros with metadata)
-"""
 
 import re
 import json
@@ -31,17 +18,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# Token Abstraction
-# ============================================================================
-
 def abstract_tool_token(tool_name: str, param_keys: List[str]) -> str:
-    """
-    Abstract a tool call into a token: tool_name[key1,key2,...]
-    This reduces parameter value noise and improves generalization.
-    
-    E.g., "filesystem-read_file" with keys ["path"] -> "filesystem-read_file[path]"
-    """
     if param_keys:
         sig = ",".join(sorted(param_keys))
         return f"{tool_name}[{sig}]"
@@ -49,7 +26,6 @@ def abstract_tool_token(tool_name: str, param_keys: List[str]) -> str:
 
 
 def extract_param_keys_from_args(args_str: str) -> List[str]:
-    """Extract parameter keys from a tool_args JSON string."""
     if not args_str:
         return []
     try:
@@ -61,18 +37,7 @@ def extract_param_keys_from_args(args_str: str) -> List[str]:
     return []
 
 
-# ============================================================================
-# Corpus Preparation
-# ============================================================================
-
 def load_successful_sequences(rl_dataset_path: str, success_only: bool = True) -> List[List[str]]:
-    """
-    Load trajectory sequences from RL dataset.
-    Each sequence is a list of abstracted tool tokens.
-    
-    Returns:
-        List of token sequences (one per successful episode)
-    """
     with open(rl_dataset_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     
@@ -104,34 +69,15 @@ def load_successful_sequences(rl_dataset_path: str, success_only: bool = True) -
     return sequences
 
 
-# ============================================================================
-# BPE Algorithm
-# ============================================================================
-
 class BPEMacroMiner:
-    """
-    BPE-style iterative merging for macro discovery.
-    
-    Given corpus C, the weighted count for adjacent pair (a, b):
-        f(a, b) = Σ_{τ∈C} Σ_{i=1}^{|τ|-1} 1[τ_i = a, τ_{i+1} = b]
-    
-    Each round selects:
-        (a*, b*) = argmax_{(a,b)} f(a, b)
-    
-    and merges all occurrences of (a*, b*) into a new token.
-    """
     
     def __init__(self, config: BPEConfig):
         self.config = config
-        # Merge history: list of (pair, new_token, frequency, round)
         self.merge_history: List[Dict] = []
-        # Final macro vocabulary
         self.macros: Dict[str, Dict] = {}
-        # Original atomic vocabulary
         self.atomic_vocab: Set[str] = set()
     
     def _count_pairs(self, sequences: List[List[str]]) -> Counter:
-        """Count all adjacent token pairs in the corpus."""
         pair_counts = Counter()
         for seq in sequences:
             for i in range(len(seq) - 1):
@@ -142,7 +88,6 @@ class BPEMacroMiner:
     def _merge_pair(
         self, sequences: List[List[str]], pair: Tuple[str, str], new_token: str
     ) -> List[List[str]]:
-        """Replace all occurrences of `pair` with `new_token` in sequences."""
         a, b = pair
         new_sequences = []
         for seq in sequences:
@@ -159,9 +104,6 @@ class BPEMacroMiner:
         return new_sequences
     
     def _get_macro_length(self, token: str) -> int:
-        """Get the number of atomic tools in a macro token."""
-        # A merged token is "tok_a ⊕ tok_b", recursively composed
-        # We track this via merge history
         if token in self.atomic_vocab:
             return 1
         for record in self.merge_history:
@@ -169,10 +111,9 @@ class BPEMacroMiner:
                 len_a = self._get_macro_length(record["pair"][0])
                 len_b = self._get_macro_length(record["pair"][1])
                 return len_a + len_b
-        return 1  # fallback
+        return 1
     
     def _decompose_macro(self, token: str) -> List[str]:
-        """Recursively decompose a macro token into atomic tool tokens."""
         if token in self.atomic_vocab:
             return [token]
         for record in self.merge_history:
@@ -180,30 +121,9 @@ class BPEMacroMiner:
                 left = self._decompose_macro(record["pair"][0])
                 right = self._decompose_macro(record["pair"][1])
                 return left + right
-        return [token]  # fallback
+        return [token]
     
     def mine(self, sequences: List[List[str]]) -> Dict[str, Dict]:
-        """
-        Run BPE macro mining.
-        
-        Args:
-            sequences: List of token sequences
-            
-        Returns:
-            Dictionary of discovered macros:
-            {
-                macro_id: {
-                    "token": merged_token_string,
-                    "atomic_sequence": [tool_token1, tool_token2, ...],
-                    "tool_names": [tool_name1, tool_name2, ...],
-                    "frequency": int,
-                    "length": int,
-                    "merge_round": int,
-                    "compression_gain": float,
-                }
-            }
-        """
-        # Collect atomic vocabulary
         for seq in sequences:
             self.atomic_vocab.update(seq)
         
@@ -214,27 +134,22 @@ class BPEMacroMiner:
         current_sequences = [list(seq) for seq in sequences]
         
         for round_idx in range(self.config.max_merges):
-            # Count pairs
             pair_counts = self._count_pairs(current_sequences)
             
             if not pair_counts:
                 logger.info(f"No more pairs to merge at round {round_idx}")
                 break
             
-            # Find the most frequent pair
             best_pair, best_freq = pair_counts.most_common(1)[0]
             
             if best_freq < self.config.min_freq:
                 logger.info(f"Best pair frequency {best_freq} < min_freq {self.config.min_freq}, stopping")
                 break
             
-            # Check max macro length constraint
             new_token = f"{best_pair[0]} ⊕ {best_pair[1]}"
             new_length = self._get_macro_length(best_pair[0]) + self._get_macro_length(best_pair[1])
             
             if new_length > self.config.max_macro_len:
-                # Skip this pair and try next
-                # Remove from counter and retry
                 del pair_counts[best_pair]
                 found = False
                 for pair, freq in pair_counts.most_common():
@@ -252,10 +167,8 @@ class BPEMacroMiner:
                     logger.info(f"No valid pair within max_macro_len at round {round_idx}")
                     break
             
-            # Compute compression gain
             total_tokens_before = sum(len(s) for s in current_sequences)
             
-            # Merge
             current_sequences = self._merge_pair(current_sequences, best_pair, new_token)
             
             total_tokens_after = sum(len(s) for s in current_sequences)
@@ -275,32 +188,26 @@ class BPEMacroMiner:
                 f"freq={best_freq}, len={new_length}, gain={compression_gain}"
             )
         
-        # Build macro dictionary with pruning
         self.macros = {}
         total_tokens = sum(len(s) for s in current_sequences)
         
         for i, record in enumerate(self.merge_history):
             macro_token = record["new_token"]
             
-            # Count current frequency (after all merges)
             current_freq = sum(
                 seq.count(macro_token) for seq in current_sequences
             )
             
-            # Pruning: check minimum usage ratio
             usage_ratio = current_freq / max(total_tokens, 1)
             if usage_ratio < self.config.min_usage_ratio and current_freq < self.config.min_freq:
                 continue
             
-            # Check minimum length
             atomic_seq = self._decompose_macro(macro_token)
             if len(atomic_seq) < self.config.min_macro_len:
                 continue
             
-            # Extract tool names from atomic sequence
             tool_names = []
             for atom in atomic_seq:
-                # Parse "tool_name[keys]" -> "tool_name"
                 if "[" in atom:
                     tool_names.append(atom.split("[")[0])
                 else:
@@ -326,42 +233,15 @@ class BPEMacroMiner:
         return self.macros
 
 
-# ============================================================================
-# Semantic Macro Naming
-# ============================================================================
-
 def _extract_function_name(tool_name: str) -> str:
-    """Extract the function part from a tool name like 'server-func_name'.
-
-    The function part is the last hyphen-separated segment that contains
-    underscores, which distinguishes it from server-prefix segments.
-
-    Examples:
-        'pdf-tools-get_pdf_info' -> 'get_pdf_info'
-        'filesystem-read_file' -> 'read_file'
-        'playwright_with_chunk-browser_click' -> 'browser_click'
-        'canvas-canvas_list_courses' -> 'canvas_list_courses'
-    """
     segments = tool_name.split("-")
-    # Find the LAST segment containing '_' (the function name)
     for i in range(len(segments) - 1, -1, -1):
         if "_" in segments[i]:
             return segments[i]
-    # Fallback: return last segment
     return segments[-1]
 
 
 def _abbreviate_function(func_name: str) -> str:
-    """Abbreviate a function name to its core action.
-
-    Examples:
-        'get_pdf_info' -> 'get_pdf'
-        'list_directory' -> 'list_dir'
-        'browser_snapshot_navigate_to_next_span' -> 'snapshot_navigate'
-        'canvas_list_courses' -> 'list_courses'
-    """
-    # Remove redundant server-name prefixes that leak into function names
-    # e.g., 'canvas_list_courses' -> 'list_courses' (remove 'canvas_' prefix)
     _redundant_prefixes = [
         "canvas_canvas_", "canvas_", "woo_", "browser_",
     ]
@@ -370,7 +250,6 @@ def _abbreviate_function(func_name: str) -> str:
             func_name = func_name[len(prefix):]
             break
 
-    # Known abbreviations
     _abbrev = {
         "list_directory": "list_dir",
         "directory_tree": "dir_tree",
@@ -388,7 +267,6 @@ def _abbreviate_function(func_name: str) -> str:
     if func_name in _abbrev:
         return _abbrev[func_name]
 
-    # General: keep at most first 3 underscore tokens
     tokens = func_name.split("_")
     if len(tokens) > 3:
         return "_".join(tokens[:3])
@@ -396,17 +274,7 @@ def _abbreviate_function(func_name: str) -> str:
 
 
 def generate_semantic_macro_id(tool_names: List[str], existing_ids: Set[str]) -> str:
-    """Generate a descriptive macro ID from the tool chain.
-
-    Examples:
-        ['pdf-tools-get_pdf_info', 'pdf-tools-read_pdf_pages']
-            -> 'get_pdf_and_read_pdf'
-        ['filesystem-list_directory', 'filesystem-read_file']
-            -> 'list_dir_and_read_file'
-        ['playwright_with_chunk-browser_type', 'playwright_with_chunk-browser_click']
-            -> 'type_and_click'
-    """
-    MAX_LEN = 70  # leave room for 'skill_' prefix (total < 77)
+    MAX_LEN = 70
 
     parts = []
     for tool_name in tool_names:
@@ -416,23 +284,19 @@ def generate_semantic_macro_id(tool_names: List[str], existing_ids: Set[str]) ->
 
     base_id = "_and_".join(parts)
 
-    # If still too long, progressively shorten each part
     if len(base_id) > MAX_LEN:
-        # Strategy: keep only first 2 underscore tokens per part
         short_parts = []
         for p in parts:
             tokens = p.split("_")
             short_parts.append("_".join(tokens[:2]) if len(tokens) > 2 else p)
         base_id = "_and_".join(short_parts)
 
-    # If STILL too long (many tools), keep first 3 and last, with count
     if len(base_id) > MAX_LEN:
         if len(parts) > 4:
             base_id = "_and_".join(parts[:3]) + f"_etc{len(parts)}"
         else:
             base_id = base_id[:MAX_LEN].rstrip("_")
 
-    # Ensure uniqueness
     candidate = base_id
     counter = 2
     while candidate in existing_ids:
@@ -443,12 +307,7 @@ def generate_semantic_macro_id(tool_names: List[str], existing_ids: Set[str]) ->
     return candidate
 
 
-# ============================================================================
-# Utility: Load tool schema info for skill instantiation
-# ============================================================================
-
 def load_tool_schemas(all_tools_path: str) -> Dict[str, Dict]:
-    """Load tool schemas from all_tools_v2.json."""
     with open(all_tools_path, "r", encoding="utf-8") as f:
         tools = json.load(f)
     
@@ -465,10 +324,6 @@ def load_tool_schemas(all_tools_path: str) -> Dict[str, Dict]:
     return schema_map
 
 
-# ============================================================================
-# Main
-# ============================================================================
-
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="AdaMacro Step 1: BPE Macro Mining")
@@ -481,10 +336,8 @@ def main():
     parser.add_argument("--success-only", action="store_true", default=True)
     args = parser.parse_args()
     
-    # Ensure output dir
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     
-    # Configure
     bpe_config = BPEConfig(
         max_merges=args.max_merges,
         min_freq=args.min_freq,
@@ -496,21 +349,17 @@ def main():
     logger.info("AdaMacro Step 1: BPE Macro Mining")
     logger.info("=" * 70)
     
-    # Step 1: Load sequences
     sequences = load_successful_sequences(args.rl_dataset, bpe_config.success_only)
     
     if not sequences:
         logger.error("No sequences found. Check RL dataset path and success_only flag.")
         return
     
-    # Step 2: Run BPE mining
     miner = BPEMacroMiner(bpe_config)
     macros = miner.mine(sequences)
     
-    # Step 3: Load tool schemas for enrichment
     tool_schemas = load_tool_schemas(args.all_tools)
     
-    # Enrich macros with tool descriptions
     for macro_id, macro in macros.items():
         enriched_tools = []
         for tname in macro["tool_names"]:
@@ -524,7 +373,6 @@ def main():
                 enriched_tools.append({"name": tname, "description": "", "params": []})
         macro["tool_details"] = enriched_tools
     
-    # Step 4: Save
     output_data = {
         "meta": {
             "algorithm": "BPE-style iterative merging",
@@ -547,7 +395,6 @@ def main():
     logger.info(f"Saved skill library to {args.output}")
     logger.info(f"Total macros: {len(macros)}")
     
-    # Print top macros
     sorted_macros = sorted(macros.values(), key=lambda m: m["current_frequency"], reverse=True)
     logger.info("\nTop 10 macros by frequency:")
     for m in sorted_macros[:10]:

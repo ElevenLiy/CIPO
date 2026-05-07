@@ -1,16 +1,3 @@
-"""
-AdaMacro: GIPO 2-GPU Pipeline Runner (for 7B/8B models)
-=========================================================
-
-Same as run_pipeline_gipo.py but Step 4 uses step4_gipo_training_2gpu.py
-with GIPO7BConfig (lower lr, smaller LoRA, gradient checkpointing).
-
-Steps 1-3 are identical. Step 4 uses 2-GPU GIPO. Step 5 evaluates from checkpoint.
-
-Usage:
-  python run_pipeline_gipo_2gpu.py --model qwen2.5-7b --steps 1,2,3,4,5
-  python run_pipeline_gipo_2gpu.py --model llama3.1-8b --steps 4,5
-"""
 
 import argparse
 import logging
@@ -44,7 +31,6 @@ logger = logging.getLogger(__name__)
 
 
 def _gipo_checkpoint_dir(model_name: str) -> str:
-    """Get GIPO-2GPU checkpoint dir."""
     short = model_name.replace("qwen2.5-", "qwen").replace("llama3.1-", "llama").replace("llama3.2-", "llama")
     return os.path.join(CHECKPOINT_DIR, f"gipo_2gpu_{short}")
 
@@ -53,9 +39,7 @@ def _gipo_eval_dir() -> str:
     return os.path.join(ADAMACRO_OUTPUT_DIR, "eval_gipo_2gpu_results")
 
 
-# Steps 1-3 are identical to other pipelines
 def run_step1(args):
-    """BPE Macro Mining."""
     from step1_bpe_mining import load_successful_sequences, BPEMacroMiner, load_tool_schemas
     import json
 
@@ -104,7 +88,6 @@ def run_step1(args):
 
 
 def run_step2(args):
-    """Skill Instantiation."""
     from step2_skill_instantiation import build_augmented_tools
     import json
 
@@ -124,7 +107,6 @@ def run_step2(args):
 
 
 def run_step3(args):
-    """SFT Training."""
     from step3_sft_training import generate_sft_data, train_sft
 
     sft_config = SFTConfig()
@@ -145,7 +127,6 @@ def run_step3(args):
 
 
 def run_step4(args):
-    """GIPO Training (2-GPU version for 7B/8B)."""
     from step4_gipo_training_2gpu import generate_grpo_rollouts, train_grpo
 
     gipo_config = GIPO7BConfig()
@@ -169,7 +150,6 @@ def run_step4(args):
 
 
 def run_step5(args):
-    """Evaluation (from GIPO checkpoint)."""
     from step5_evaluation import evaluate
 
     eval_config = EvalConfig(
@@ -214,19 +194,16 @@ def main():
                        choices=["base", "sft", "grpo"],
                        help="Evaluation stage (grpo = GIPO checkpoint)")
 
-    # BPE params
     parser.add_argument("--max-merges", type=int, default=50)
     parser.add_argument("--min-freq", type=int, default=3)
     parser.add_argument("--max-macro-len", type=int, default=6)
 
-    # Training params
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lora-rank", type=int, default=None)
     parser.add_argument("--group-size", type=int, default=None)
 
-    # Eval params
     parser.add_argument("--max-turns", type=int, default=30)
     parser.add_argument("--max-atomic-calls", type=int, default=50)
     parser.add_argument("--max-episodes", type=int, default=100)

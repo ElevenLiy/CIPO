@@ -1,31 +1,3 @@
-"""
-AdaMacro: Universal Multi-Dataset GIPO Pipeline Runner
-=======================================================
-
-A single pipeline script that works with ANY dataset (TOOLATHLON, Toucan,
-Traject-bench, etc.) by accepting dataset paths via command-line arguments.
-
-Supports both single-GPU (1.5B/3B) and 2-GPU (7B/8B) training.
-
-Usage:
-  # Toucan + qwen2.5-1.5b (single GPU)
-  python run_pipeline_gipo_dataset.py \
-      --dataset toucan \
-      --rl-dataset /path/to/rl_dataset_toucan.json \
-      --all-tools /path/to/all_tools_toucan.json \
-      --tool-simulator-db /path/to/tool_simulator_database_toucan.json \
-      --output-dir /path/to/outputs/toucan \
-      --model qwen2.5-1.5b --steps 1,2,3,4,5
-
-  # Traject-bench + llama3.1-8b (2 GPU)
-  python run_pipeline_gipo_dataset.py \
-      --dataset traject \
-      --rl-dataset /path/to/rl_dataset_llm.json \
-      --all-tools /path/to/all_tools.json \
-      --tool-simulator-db /path/to/tool_simulator_database.json \
-      --output-dir /path/to/outputs/traject \
-      --model llama3.1-8b --steps 1,2,3,4,5 --gpu-mode 2gpu
-"""
 
 import argparse
 import logging
@@ -43,40 +15,25 @@ from configs.config import (
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# Model → Config mapping
-# ============================================================================
-
-# Models that should use 2-GPU config (GIPO7BConfig)
 _2GPU_MODELS = {"qwen2.5-7b", "llama3.1-8b"}
 
-# Models that should use 3B config (GIPO3BConfig)
 _3B_MODELS = {"llama3.2-3b"}
 
 
 def _model_short(model_name: str) -> str:
-    """Convert model name to directory-safe short name.
-    e.g. 'qwen2.5-1.5b' -> 'qwen25_15b', 'llama3.2-3b' -> 'llama32_3b'
-    """
     return model_name.replace(".", "").replace("-", "_")
 
 
 def _get_gipo_config(model_name: str, gpu_mode: str):
-    """Select the right GIPO config based on model size and GPU mode."""
     if gpu_mode == "2gpu" or model_name in _2GPU_MODELS:
         return GIPO7BConfig()
     elif model_name in _3B_MODELS:
         return GIPO3BConfig()
     else:
-        return GRPOConfig()  # default for 1.5B
+        return GRPOConfig()
 
-
-# ============================================================================
-# Path helpers
-# ============================================================================
 
 class DatasetPaths:
-    """Holds all resolved paths for a dataset + model combination."""
 
     def __init__(self, output_dir: str, model_name: str, gpu_mode: str,
                  rl_dataset: str, all_tools: str, tool_simulator_db: str):
@@ -85,36 +42,26 @@ class DatasetPaths:
         self.tool_simulator_db = tool_simulator_db
         self.output_dir = output_dir
 
-        # Intermediate outputs (per-dataset, shared across models)
         self.skill_library = os.path.join(output_dir, "skill_library.json")
         self.augmented_tools = os.path.join(output_dir, "augmented_tools.json")
         self.sft_data = os.path.join(output_dir, "sft_data.json")
         self.grpo_data = os.path.join(output_dir, "grpo_data.json")
 
-        # Checkpoints (per-dataset, per-model)
         self.checkpoint_dir = os.path.join(output_dir, "checkpoints")
         self.sft_dir = os.path.join(self.checkpoint_dir, "sft", model_name)
 
-        # GIPO checkpoint: e.g. checkpoints/gipo_qwen25_15b/ or checkpoints/gipo_2gpu_llama31_8b/
         prefix = "gipo_2gpu" if gpu_mode == "2gpu" else "gipo"
         self.gipo_dir = os.path.join(self.checkpoint_dir, f"{prefix}_{_model_short(model_name)}")
 
-        # Eval results
         self.eval_dir = os.path.join(output_dir, f"eval_{prefix}_{_model_short(model_name)}_results")
 
     def ensure_dirs(self):
-        """Create all necessary directories."""
         for d in [self.output_dir, self.checkpoint_dir, self.sft_dir,
                   self.gipo_dir, self.eval_dir]:
             os.makedirs(d, exist_ok=True)
 
 
-# ============================================================================
-# Pipeline Steps
-# ============================================================================
-
 def run_step1(args, paths: DatasetPaths):
-    """BPE Macro Mining."""
     from step1_bpe_mining import load_successful_sequences, BPEMacroMiner, load_tool_schemas
     import json
 
@@ -162,7 +109,6 @@ def run_step1(args, paths: DatasetPaths):
 
 
 def run_step2(args, paths: DatasetPaths):
-    """Skill Instantiation."""
     from step2_skill_instantiation import build_augmented_tools
     import json
 
@@ -182,7 +128,6 @@ def run_step2(args, paths: DatasetPaths):
 
 
 def run_step3(args, paths: DatasetPaths):
-    """SFT Training."""
     from step3_sft_training import generate_sft_data, train_sft
 
     sft_config = SFTConfig()
@@ -202,7 +147,6 @@ def run_step3(args, paths: DatasetPaths):
 
 
 def run_step4(args, paths: DatasetPaths):
-    """GIPO Training (single-GPU or 2-GPU based on gpu_mode)."""
 
     gipo_config = _get_gipo_config(args.model, args.gpu_mode)
     if args.epochs: gipo_config.num_epochs = args.epochs
@@ -227,7 +171,6 @@ def run_step4(args, paths: DatasetPaths):
 
 
 def run_step5(args, paths: DatasetPaths):
-    """Evaluation."""
     from step5_evaluation import evaluate
 
     eval_config = EvalConfig(
@@ -261,15 +204,10 @@ def run_step5(args, paths: DatasetPaths):
     logger.info(f"Step 5 done: {output_path}")
 
 
-# ============================================================================
-# Main
-# ============================================================================
-
 def main():
     parser = argparse.ArgumentParser(
         description="AdaMacro: Universal Multi-Dataset GIPO Pipeline")
 
-    # --- Dataset paths (REQUIRED) ---
     parser.add_argument("--dataset", type=str, required=True,
                        help="Dataset name (e.g., toucan, traject)")
     parser.add_argument("--rl-dataset", type=str, required=True,
@@ -281,7 +219,6 @@ def main():
     parser.add_argument("--output-dir", type=str, required=True,
                        help="Output directory for this dataset")
 
-    # --- Model & steps ---
     parser.add_argument("--model", type=str, default="qwen2.5-1.5b",
                        choices=["qwen2.5-1.5b", "qwen2.5-7b", "llama3.1-8b", "llama3.2-3b"])
     parser.add_argument("--steps", type=str, default="1,2,3,4,5",
@@ -292,26 +229,22 @@ def main():
                        choices=["1gpu", "2gpu"],
                        help="GPU mode: 1gpu (single GPU) or 2gpu (model parallel)")
 
-    # BPE params
     parser.add_argument("--max-merges", type=int, default=50)
     parser.add_argument("--min-freq", type=int, default=3)
     parser.add_argument("--max-macro-len", type=int, default=6)
 
-    # Training params
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lora-rank", type=int, default=None)
     parser.add_argument("--group-size", type=int, default=None)
 
-    # Eval params
     parser.add_argument("--max-turns", type=int, default=30)
     parser.add_argument("--max-atomic-calls", type=int, default=50)
     parser.add_argument("--max-episodes", type=int, default=100)
 
     args = parser.parse_args()
 
-    # --- Setup logging ---
     log_dir = os.path.join(Path(__file__).resolve().parent.parent, "logs")
     os.makedirs(log_dir, exist_ok=True)
     logging.basicConfig(
@@ -326,7 +259,6 @@ def main():
         ]
     )
 
-    # --- Resolve paths ---
     paths = DatasetPaths(
         output_dir=args.output_dir,
         model_name=args.model,

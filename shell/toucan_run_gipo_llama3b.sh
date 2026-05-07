@@ -11,12 +11,6 @@
 #SBATCH --error=logs/toucan_gipo_llama3b_%j.err
 #SBATCH --partition=fengl2
 
-# ===========================================================================
-# Toucan Dataset — GIPO Single-GPU — LLaMA 3.2-3B
-# ===========================================================================
-# Checkpoint: outputs/toucan/checkpoints/gipo_llama32_3b/
-# Eval:       outputs/toucan/eval_gipo_llama32_3b_results/
-# ===========================================================================
 
 MODEL="llama3.2-3b"
 STEPS=${1:-"3,4,5"}

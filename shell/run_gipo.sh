@@ -11,27 +11,11 @@
 #SBATCH --error=logs/gipo_%j.err
 #SBATCH --partition=fengl2
 
-# ===========================================================================
-# GIPO Experiment Runner (Granularity-Imagination Policy Optimization)
-# ===========================================================================
-# Usage:
-#   sbatch run_gipo.sh                              # Default: qwen2.5-7b, all steps
-#   sbatch run_gipo.sh qwen2.5-1.5b 1,2,3,4,5      # Specify model and steps
-#   sbatch run_gipo.sh qwen2.5-1.5b 4,5             # Only GIPO training + eval
-#   sbatch run_gipo.sh qwen2.5-7b 5 sft             # Evaluate SFT only
-#
-# Checkpoint directories:
-#   GIPO checkpoints: checkpoints/gipo_qwen1.5b/
-#   GIPO eval results: eval_gipo_results/
-#   (SFT checkpoints are shared with run_adamacro.sh)
-# ===========================================================================
 
-# --- Parameters ---
 MODEL=${1:-"qwen2.5-7b"}
 STEPS=${2:-"1,2,3,4,5"}
 STAGE=${3:-"grpo"}
 
-# --- Project paths ---
 ADAMACRO_DIR="/path/to/CIPO"
 cd ${ADAMACRO_DIR}
 
@@ -49,11 +33,9 @@ echo "Stage:      ${STAGE}"
 echo "Time:       $(date)"
 echo "============================================================"
 
-# --- Environment setup ---
 source $CONDA_PREFIX/etc/profile.d/conda.sh
 conda activate tool
 
-# --- Run GIPO pipeline ---
 python scripts/run_pipeline_gipo.py \
     --model ${MODEL} \
     --steps ${STEPS} \

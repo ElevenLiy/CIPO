@@ -11,12 +11,6 @@
 #SBATCH --error=logs/toucan_gipo_qwen7b_2gpu_%j.err
 #SBATCH --partition=fengl2
 
-# ===========================================================================
-# Toucan Dataset — GIPO 2-GPU — Qwen2.5-7B
-# ===========================================================================
-# Checkpoint: outputs/toucan/checkpoints/gipo_2gpu_qwen25_7b/
-# Eval:       outputs/toucan/eval_gipo_2gpu_qwen25_7b_results/
-# ===========================================================================
 
 MODEL="qwen2.5-7b"
 STEPS=${1:-"3,4,5"}
